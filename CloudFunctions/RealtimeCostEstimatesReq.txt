@@ -1,0 +1,4 @@
+google-cloud-storage
+google-cloud-bigquery
+google-cloud-logging
+google-api-python-client==1.9.3

@@ -1,0 +1,14 @@
+[
+  {
+    "name": "pd_key",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": ""
+  },
+  {
+    "name": "pd",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": ""
+  }
+]

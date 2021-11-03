@@ -1,0 +1,62 @@
+centos-6,CentOS 6,high
+centos-7,CentOS 7,high
+centos-8,CentOS 8,high
+cos,Container-Optimized OS from Google,low
+debian-8-jessie,Debian 8 Jessie,high
+debian-9-stretch,Debian 9 Stretch,high
+debian-10-buster,Debian 10 Buster,high
+debian-10-bullseye,Debian 11 Bullseye,medium
+fedora-coreos-next,Fedora CoreOS Next,high
+fedora-coreos-stable,Fedora CoreOS Stable,high
+fedora-coreos-testing,Fedora CoreOS Testing,high
+rhel-7-4-sap,RHEL 7 for SAP Applications,low
+rhel-7-7-sap-ha,RHEL 7 for SAP HANA,low
+rhel-8-2-sap-ha,Red Hat Enterprise Linux for SAP with High Availability and Update Services,low
+rhel-6,RedHat Enterprise Linux 6,medium
+rhel-7,RedHat Enterprise Linux 7,medium
+rhel-8,RedHat Enterprise Linux 8,medium
+sles-12-sap,SLES 12 for SAP,low
+sles-15-sap,SLES 15 For SAP License,low
+sles-12,SUSE Linux Enterprise 12,medium
+sles-15,SUSE Linux Enterprise Server 15,medium
+sql-2012-enterprise-windows-2012-r2-dc,SQL Server 2012 Enterprise,low
+sql-2012-standard-windows-2012-r2-dc,SQL Server 2012 Standard,low
+sql-2012-web-windows-2012-r2-dc,SQL Server 2012 Web,low
+sql-2014-enterprise-windows-2012-r2-dc,SQL Server 2014 Enterprise,low
+sql-2014-enterprise-windows-2016-dc,SQL Server 2014 Enterprise,low
+sql-2014-standard-windows-2012-r2-dc,SQL Server 2014 Standard,low
+sql-2014-web-windows-2012-r2-dc,SQL Server 2014 Web,low
+sql-2016-enterprise-windows-2012-r2-dc,SQL Server 2016 Enterprise,low
+sql-2016-enterprise-windows-2016-dc,SQL Server 2016 Enterprise,low
+sql-2016-enterprise-windows-2019-dc,SQL Server 2016 Enterprise,low
+sql-2016-standard-windows-2012-r2-dc,SQL Server 2016 Standard,low
+sql-2016-standard-windows-2016-dc,SQL Server 2016 Standard,low
+sql-2016-standard-windows-2019-dc,SQL Server 2016 Standard,low
+sql-2016-web-windows-2012-r2-dc,SQL Server 2016 Web,low
+sql-2016-web-windows-2016-dc,SQL Server 2016 Web,low
+sql-2016-web-windows-2019-dc,SQL Server 2016 Web,low
+sql-2017-enterprise-windows-2016-dc,SQL Server 2017 Enterprise,low
+sql-2017-enterprise-windows-2019-dc,SQL Server 2017 Enterprise,low
+sql-2017-express-windows-2012-r2-dc,SQL Server 2017 Express,low
+sql-2017-express-windows-2016-dc,SQL Server 2017 Express,low
+sql-2017-express-windows-2019-dc,SQL Server 2017 Express,low
+sql-2017-standard-windows-2016-dc,SQL Server 2017 Standard,low
+sql-2017-standard-windows-2019-dc,SQL Server 2017 Standard,low
+sql-2017-web-windows-2016-dc,SQL Server 2017 Web,low
+sql-2017-web-windows-2019-dc,SQL Server 2017 Web,low
+ubuntu-1604-lts,Ubuntu 16.04 (Xenial Xerus),medium
+ubuntu-1804-lts,Ubuntu 18.04 LTS (Bionic Beaver),medium
+ubuntu-2004-lts,Ubuntu 20.04 LTS (Focal Fossa),high
+ubuntu-minimal-1604-lts,Ubuntu Minimal 16.04 LTS (Xenial Xerus),medium
+ubuntu-minimal-1804-lts,Ubuntu Minimal 18.04 LTS (Bionic Beaver),medium
+ubuntu-minimal-2004-lts,Ubuntu Minimal 20.04 LTS (Focal Fossa),medium
+windows-server-2004-dc-core,Windows Server Core,low
+windows-server-2012-r2-dc-core,Windows Server Core,low
+windows-server-2012-r2-dc,Windows Server 2012 R2 Datacenter Edition,low
+windows-server-2016-dc-core,Windows Server Core,low
+windows-server-2016-dc,Windows Server 2016 Datacenter Edition,low
+windows-server-2019-dc-core-for-containers,Windows container host,low
+windows-server-2019-dc-core,Windows Server Core,low
+windows-server-2019-dc-for-containers,Windows container host,low
+windows-server-2019-dc,Windows Server 2019 Datacenter Edition,low
+windows-server-20h2-dc-core,Windows Server Core,low

@@ -1,0 +1,14 @@
+[
+  {
+    "name": "gpu_key",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": ""
+  },
+  {
+    "name": "gpu",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": ""
+  }
+]

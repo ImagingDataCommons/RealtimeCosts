@@ -1,0 +1,88 @@
+
+version: 1
+files_and_buckets_and_tables:
+  # Run all BQ jobs in Batch mode? Slower but uses less of quotas:
+  BQ_AS_BATCH: False
+
+  # What bucket is going to get the text file heading to BQ?
+  WORKING_BUCKET: name_of_config_bucket
+
+  # What project are we in:
+  WORKING_PROJECT: name_of_project
+
+  # Where is the BQ table dataset:
+  TARGET_DATASET: price_tables_dataset
+
+  # Directory for map files:
+  MAP_TSV_DIR: PathToThisProject/RealtimeCosts/Mappings
+
+  # Directory for schema files:
+  SCHEMA_DIR: PathToThisProject/RealtimeCosts/Schemas
+
+  # Where is the table that sku pricing has been exported to:
+  SKU_TABLE: project_name.dataset_name.cloud_pricing_export
+
+  # What are the tables that we are creating:
+  CPU_PRICING: CPU_pricing
+  RAM_PRICING: RAM_pricing
+  GPU_PRICING: GPU_pricing
+  PD_PRICING: PD_pricing
+  CPU_LIC_PRICING: CPU_LIC_pricing
+  GPU_LIC_PRICING: GPU_LIC_pricing
+  RAM_LIC_PRICING: RAM_LIC_pricing
+  IP_PRICING: IP_pricing
+
+mappings:
+  - machine_key_to_cpu:
+      csv: CPU-mappings.csv
+      schema: cpu-table-schema.json
+      env: KEY_MAP
+  - gpu_key_to_gpu:
+      csv: GPU-mapping.csv
+      schema: gpu-table-schema.json
+      env: GPU_KEY_MAP
+  - pd_key_to_pd:
+      csv: PD-mapping.csv
+      schema: pd-table-schema.json
+      env: PD_KEY_MAP
+  - lic_key_to_lic:
+      csv: LIC-mapping.csv
+      schema: lic-table-schema.json
+      env: LIC_KEY_MAP
+
+steps:
+
+  # Get mapping CSVs into bucket:
+  - upload_map_csvs
+
+  # Build map tables
+  - build_map_tables_from_csvs
+
+  # Build CPU price table
+  - build_cpu_pricing
+
+  #  Build RAM price table
+  - build_ram_pricing
+
+  # Build GPU price table
+  - build_gpu_pricing
+
+  # Build persistent disk price table
+  - build_pd_pricing
+
+  # Build CPU licensing price table
+  - build_cpu_lic_pricing
+
+  # Build GPU licensing price table
+  - build_gpu_lic_pricing
+
+  # Build RAM licensing price table
+  - build_ram_lic_pricing
+
+  # Build IP address  price table
+  - build_ip_pricing
+
+  # Output env vars
+  - print_env_vars
+
+

@@ -1,0 +1,27 @@
+a2-custom,A2 Instance Core,A2 Instance Ram
+a2-highgpu,A2 Instance Core,A2 Instance Ram
+a2-megagpu,A2 Instance Core,A2 Instance Ram
+c2-standard,Compute optimized Core,Compute optimized Ram
+e2-custom,Custom Instance Core,Custom Instance Ram
+e2-highcpu,E2 Instance Core,E2 Instance Ram
+e2-highmem,E2 Instance Core,E2 Instance Ram
+e2-medium,E2 Instance Core,E2 Instance Ram
+e2-micro,E2 Instance Core,E2 Instance Ram
+e2-small,E2 Instance Core,E2 Instance Ram
+e2-standard,E2 Instance Core,E2 Instance Ram
+f1-micro,Micro Instance with burstable CPU,
+g1-small,Small Instance with 1 VCPU,
+m1-megamem,Memory-optimized Instance Core,Memory-optimized Instance Ram
+m1-ultramem,Memory-optimized Instance Core,Memory-optimized Instance Ram
+n1-custom,Custom Instance Core,Custom Instance Ram
+n1-highcpu,N1 Predefined Instance Core,N1 Predefined Instance Ram
+n1-highmem,N1 Predefined Instance Core,N1 Predefined Instance Ram
+n1-standard,N1 Predefined Instance Core,N1 Predefined Instance Ram
+n2-custom,N2 Custom Instance Core,N2 Custom Instance Ram
+n2-highcpu,N2 Instance Core,N2 Instance Ram
+n2-highmem,N2 Instance Core,N2 Instance Ram
+n2-standard,N2 Instance Core,N2 Instance Ram
+n2d-custom,N2D AMD Custom Instance Core,N2D AMD Custom Instance Ram
+n2d-highcpu,N2D AMD Instance Core,N2D AMD Instance Ram
+n2d-highmem,N2D AMD Instance Core,N2D AMD Instance Ram
+n2d-standard,N2D AMD Instance Core,N2D AMD Instance Ram

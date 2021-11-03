@@ -1,0 +1,20 @@
+[
+  {
+    "name": "machine_key",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": ""
+  },
+  {
+    "name": "cpu",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": ""
+  },
+  {
+    "name": "ram",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": ""
+  }
+]
