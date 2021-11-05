@@ -257,12 +257,12 @@ def _machine_cost(machine_info, type_dict, vm_pricing_cache, gpu_pricing_cache,
 
     for interval, hours in hour_dict.items():
         machine_cost = 0.0
-        cpu_per_hour = 0.0
+        core_per_hour = 0.0
         gb_per_hour = 0.0
         if price_lineitem is not None:
             no_calc = False
             if price_lineitem[4] == "HOUR":
-                cpu_per_hour = price_lineitem[3]
+                core_per_hour = price_lineitem[3]
             else:
                 no_calc = True
             if price_lineitem[6] is None:
@@ -272,7 +272,8 @@ def _machine_cost(machine_info, type_dict, vm_pricing_cache, gpu_pricing_cache,
             else:
                 no_calc = True
             if not no_calc:
-                machine_cost = (hours * cpu_per_hour * cpus) + (hours * memory_gb * gb_per_hour)
+                # Machine type includes the CPU count. Do not multiply by CPU count!
+                machine_cost = (hours * core_per_hour) + (hours * memory_gb * gb_per_hour)
             else:
                 raise Exception("unexpected pricing units: {} {}".format(price_lineitem[4], price_lineitem[6]))
         else:
