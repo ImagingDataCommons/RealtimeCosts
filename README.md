@@ -34,7 +34,7 @@ budget alert is monthly, but that the budget set specifies the "all-time" spendi
 keeps state in a bucket in project "B" that you specify. One gotcha is that it assumes an empty file for project "A"
 already exists in the bucket. (still a to-do).  Note that each project has a separate file, since the function
 is being triggered by each separate project, and we want to avoid race conditions. (Note the function usuall takes
-10-20 seconds to run for each project it processes). With enough projects to moniotor, it might fall behind (?). This
+10-20 seconds to run for each project it processes). With enough projects to monitor, it might fall behind (?). This
 has not been explored.
 
 In addition to monitoring the overall spending reported, the function checks if reported egress out of the cloud
@@ -52,7 +52,7 @@ provides another way to cap VM usage. It counts the number of CPUs running in th
 a configurable value, the function will shut down VMs in a LIFO fashion to get back under the limit.
 
 Finally, one of the big shortcomings of the above system is that the published spending numbers can lag actual
-expence by 12 hours (give or take). So shutting a project down based on stale numbers may be too late to avoid
+expense by 12 hours (give or take). So shutting a project down based on stale numbers may be too late to avoid
 unexpected charges. Thus, this function also estimates the current burn rate for running VMs and persistent storage
 each time the function runs (e.g. every 20 minutes). If the system detects that existing reported spending, plus
 12 hours of this estimated burn, will exceed the budget by a specified multiplier, it will shut down all running VMs.
@@ -61,6 +61,11 @@ To achieve this, a set of BigQuery tables need to be created in project "B" that
 with running VMs. The seed for these tables is the SKU export table that Google will create if this export is
 specified for the billing account. With that table in hand, running the function "extract-sku-tables-from-desktop.sh"
 pointed at that table will generate all the specified SKU tables needed by the cloud function to do this estimation.
+Note this routine uses the standard method used by the ISB-CGC ETL system, where config files to run the script
+live in a cloud configuration bucket. Usually those scripts run on a VM, but the "-from-desktop" bit means this
+script is set up to run on your local laptop, usually after running "gcloud auth application-default login"
+to get the script to run locally using personal credentials. (Remember to run "gcloud auth application-default revoke"
+when done to get back to normal service account-driven script execution.
 
 Quantifying this spending exactly is a work in progress, and currently involves educated guesswork as to how
 a CPU tag maps to specific CPU and RAM SKUs. E.g., it appears that "c2-standard" might map to "Compute optimized Core"
