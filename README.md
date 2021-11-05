@@ -74,6 +74,9 @@ to improve the mapping tables are welcome.
 Finally, these price estimates do not include tiered pricing and discounts (or external IP charges, yet). It
 is intended to be conservative. But these enhancements would be useful.
 
+Note that the cloud function can be triggered from an HTTP entry point if you just want to run the realtime
+estimates. To track a budget and (maybe) shut down resources, the Pub/Sub entry is the one to use.
+
 
 
 

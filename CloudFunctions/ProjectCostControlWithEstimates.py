@@ -77,12 +77,12 @@ def pubsub_trigger(data, context):
 
 '''
 ----------------------------------------------------------------------------------------------
-Trigger for PubSub
+Common function to handle both entry points.
 '''
 
 def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_burn):
 
-    message_root_fmt = "EXTERNAL BUDGET ALERT {}"
+    message_root_fmt = "EXTERNAL BUDGET ALERT {}" # USE this to trigger monitoring alerts.
 
     #
     # If we are not just doing a burn estimate, we get here via a pubsub message about every 20 minutes all
