@@ -1,4 +1,5 @@
 #
+# Copyright 2018 Google LLC
 # Copyright 2020, 2021 Institute for Systems Biology
 #
 # Licensed under the Apache License, Version 2.0 (the 'License');
@@ -20,9 +21,11 @@ import time
 import datetime
 
 from googleapiclient import discovery
+from googleapiclient.errors import HttpError
 from google.cloud import storage
 from google.cloud import bigquery
 from google.cloud import logging as glog
+
 
 KEY_MAP = os.environ["KEY_MAP"]
 GPU_KEY_MAP = os.environ["GPU_KEY_MAP"]
@@ -37,6 +40,13 @@ CPU_LIC_PRICES = os.environ["CPU_LIC_PRICES"]
 GPU_LIC_PRICES = os.environ["GPU_LIC_PRICES"]
 RAM_LIC_PRICES = os.environ["RAM_LIC_PRICES"]
 
+STATE_BUCKET = os.environ["STATE_BUCKET"]
+PULL_MULTIPLIER = float(os.environ["PULL_MULTIPLIER"])
+ESTIMATE_PULL_MULTIPLIER = float(os.environ["ESTIMATE_PULL_MULTIPLIER"])
+COST_BQ = os.environ["COST_BQ"]
+EGRESS_NOTIFY_MULTIPLIER = float(os.environ["EGRESS_NOTIFY_MULTIPLIER"])
+MAX_CPUS = int(os.environ["MAX_CPUS"])
+
 PROJECT_ID = os.environ["PROJECT_ID"]
 
 '''
@@ -45,14 +55,7 @@ Trigger for HTTP
 '''
 def web_trigger(request):
     project_id = PROJECT_ID
-    state_bucket = os.environ["STATE_BUCKET"]
-    state_blob = "{}_state.json".format(project_id)
-    storage_client = storage.Client()
-    bucket = storage_client.get_bucket(state_bucket)
-    cost_state = retrieve_cost_state(bucket, state_blob)
-    cost_calculate(project_id)
-    roll_cost_state(cost_state)
-    stash_cost_state(cost_state, bucket, state_blob)
+    control_billing(project_id, None, None, None, True)
     return "Completed"
 
 '''
@@ -62,68 +65,142 @@ Trigger for PubSub
 def pubsub_trigger(data, context):
     pubsub_data = base64.b64decode(data['data']).decode('utf-8')
     pubsub_json = json.loads(pubsub_data)
+    cost_amount = pubsub_json['costAmount']
+    budget_amount = pubsub_json['budgetAmount']
     budget_name = pubsub_json["budgetDisplayName"]
     project_id = budget_name.replace('-budget', '')
-    state_bucket = os.environ["STATE_BUCKET"]
-    state_blob = "{}_state.json".format(project_id)
-    storage_client = storage.Client()
-    bucket = storage_client.get_bucket(state_bucket)
-    cost_state = retrieve_cost_state(bucket, state_blob)
-    cost_calculate(project_id)
-    roll_cost_state(cost_state)
-    stash_cost_state(cost_state, bucket, state_blob)
+    cis = pubsub_json["costIntervalStart"]
+    print('Project {} cost: {} reports at {}: start: {} '.format(project_id, str(pubsub_json["costAmount"]),
+                                                                            context.timestamp, str(cis)))
+    control_billing(project_id, cost_amount, budget_amount, cis, False)
     return
 
 '''
 ----------------------------------------------------------------------------------------------
-Retrieve stored function state from bucket
+Trigger for PubSub
 '''
-def retrieve_cost_state(state_bucket, state_blob):
 
-    blob = state_bucket.blob(state_blob)
-    blob_str = blob.download_as_string() if blob.exists() else b''
-    cost_state = {"costs_previous_months_archived": {},
-                  "costs_current_month_archived": {},
-                  "costs_current_month_live": {}
-                 } if (blob_str == b'') else json.loads(blob_str)
+def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_burn):
 
-    return cost_state
-'''
-----------------------------------------------------------------------------------------------
-Stash stored function state in bucket
-'''
-def stash_cost_state(cost_state, state_bucket, state_blob):
-    blob = state_bucket.blob(state_blob)
-    blob.upload_from_string(json.dumps(cost_state))
-    return
+    message_root_fmt = "EXTERNAL BUDGET ALERT {}"
+
+    #
+    # If we are not just doing a burn estimate, we get here via a pubsub message about every 20 minutes all
+    # month long. We don't really care about the monthly billing here, we care about the cumulative amount
+    # over several months which is what will cause a shutdown. But if we just want a burn estimate, we can
+    # skip lots of stuff here:
+    #
+
+    need_to_act = False
+    fraction  = 0.0
+    total_spend = 0.0
+    project_name = 'projects/{}'.format(project_id)
+
+    log_client = glog.Client(project=project_id)
+    log_client.get_default_handler()
+    log_client.setup_logging()
+    cost_logger = log_client.logger("cost_estimation_log")
+
+    if not only_estimate_burn:
+
+        #
+        # Get the state for the budget:
+        #
+
+        state_blob = "{}_state.json".format(project_id)
+        week_num = datetime.datetime.now().strftime("%V")
+
+        storage_client = storage.Client()
+        bucket = storage_client.get_bucket(STATE_BUCKET)
+
+        blob = bucket.blob(state_blob)
+        blob_str = blob.download_as_string() if blob.exists() else b''
+        raw_budget_state = {"budget": budget_amount, "messages": {}, "amounts": {cis: 0}} if (blob_str == b'') else json.loads(blob_str)
+        # Bring old dicts up to speed. Messages were added before budget, so this order catches all cases:
+        if "messages" not in raw_budget_state:
+            budget_super_state = {"messages": {}, "amounts": raw_budget_state}
+        else:
+            budget_super_state = raw_budget_state
+
+        if ("budget" not in budget_super_state) or (budget_super_state['budget'] != budget_amount):
+            budget_super_state['budget'] = budget_amount
+
+        budget_state = budget_super_state['amounts']
+        budget_state[cis] = cost_amount
+        message_state = budget_super_state['messages']
+
+        #
+        # How much is being spent to move data around:
+        #
+
+        total_egress = float(_calc_egress(COST_BQ, project_id))
+        print("Project {} total egress and download: {}".format(project_id, total_egress))
+        egress_thresh = EGRESS_NOTIFY_MULTIPLIER * float(budget_amount)
+        if total_egress > egress_thresh:
+            message_key = message_root_fmt.format("1")
+            fire_off = (message_key not in message_state) or message_state[message_key] != week_num
+            if fire_off:
+                print("{}: Project {} total egress and download ({}) exceeds threshold {} ".format(message_key, project_id, total_egress, egress_thresh))
+                message_state[message_key] = week_num
+
+        #
+        # Sum up all months of expenses:
+        #
+
+        total_spend = 0
+        for month, cost_amount in budget_state.items():
+            total_spend += cost_amount
+        fraction = float(total_spend) / float(budget_amount)
+
+        message = "Project: {} Budget: {} Spent: {:.2f} Fraction: {:.4f}".format(project_id, budget_amount, total_spend, fraction)
+        cost_logger.log_text(message)
+
+        need_to_act = (fraction >= 1.0)
+
+        if need_to_act:
+            message_key = message_root_fmt.format("2")
+            fire_off = (message_key not in message_state) or message_state[message_key] != week_num
+            if fire_off:
+                print("{}: Project {} is now over budget! fraction {}".format(message_key, project_id, str(fraction)))
+                message_state[message_key] = week_num
+
+        #
+        # Stash the latest cost data and message status back in the bucket before we wander off and do things, just in
+        # case everything goes nuts:
+        #
+
+        # Seems we get a checksum complaint if we don't reinitialize the blob:
+        blob = bucket.blob(state_blob)
+        blob.upload_from_string(json.dumps(budget_super_state))
+
+    #
+    # We want to limit the number of instances that can be run without having to set a quota. We also want to
+    # calculate the current burn rate. Both require an inventory of all VMs in the project:
+    #
+
+    excess_vm_stop_list = []
+    compute_inventory = {}
+    is_enabled = _check_compute_services_for_project(project_id)
+    if is_enabled:
+        compute = discovery.build('compute', 'v1', cache_discovery=False)
+        compute_inventory, type_dict, total_cpus = _check_compute_engine_inventory_aggregate(compute, project_id)
+        for k, v in compute_inventory.items():
+            print("Project {} instance {} info {}".format(project_id, str(k), json.dumps(v)))
+        print("Project {} cpu count {}".format(project_id, total_cpus))
+        if (not only_estimate_burn) and (total_cpus > MAX_CPUS):
+            message_key = message_root_fmt.format("3")
+            shutdown = total_cpus - MAX_CPUS
+            print("{}: Project {} is over CPU limit: {} Shutting down {}".format(message_key, project_id, total_cpus, shutdown))
+            excess_vm_stop_list = _prepare_shutdown_list(compute_inventory, shutdown)
+    else:
+        type_dict = None
+        compute = None
+        print("Project {} does not have compute enabled".format(project_id))
 
 
-'''
-----------------------------------------------------------------------------------------------
-Update cost state
-'''
-def roll_cost_state(cost_state):
-    # Not doing this yet...
-    return
-
-'''
-----------------------------------------------------------------------------------------------
-Calculate costs
-'''
-def are_we_spending(vm_cost_breakdown, disks_cost_breakdown):
-
-    total = 0.0
-    for val in vm_cost_breakdown.values():
-        total += val
-    for val in disks_cost_breakdown.values():
-        total += val
-    return total > 0.0
-
-'''
-----------------------------------------------------------------------------------------------
-Calculate costs
-'''
-def cost_calculate(project_id):
+    #
+    # With the VM inventory, we run an estimate of current VM burn rate:
+    #
 
     vm_pricing_cache = {}
     gpu_pricing_cache = {}
@@ -135,16 +212,13 @@ def cost_calculate(project_id):
     vm_cost_breakdown = {'uptime': 0.0,
                          'last_day': 0.0,
                          'hourly': 0.0
-                        }
+                         }
     disks_cost_breakdown = {'uptime': 0.0,
                             'last_day': 0.0,
                             'hourly': 0.0
-                           }
+                            }
     vm_count = 0
-    is_enabled = _check_compute_services_for_project(project_id)
     if is_enabled:
-        compute = discovery.build('compute', 'v1', cache_discovery=False)
-        compute_inventory, type_dict, total_cpus = _check_compute_engine_inventory_aggregate(compute, project_id)
         for k, v in compute_inventory.items():
             machine_breakdown = _machine_cost(v, type_dict, vm_pricing_cache, gpu_pricing_cache,
                                               cpu_lic_pricing_cache, gpu_lic_pricing_cache, ram_lic_pricing_cache)
@@ -159,14 +233,13 @@ def cost_calculate(project_id):
             disks_cost_breakdown['last_day'] += disk_cost_breakdown['last_day']
             disks_cost_breakdown['hourly'] += disk_cost_breakdown['hourly']
 
-    else:
-        print("Project {} does not have compute enabled".format(project_id))
+    #
+    # Actually figure out the burn rate if money is being spent:
+    #
 
+    total_hourly_cost = 0.0
     if are_we_spending(vm_cost_breakdown, disks_cost_breakdown):
-        log_client = glog.Client(project=project_id)
-        log_client.get_default_handler()
-        log_client.setup_logging()
-        cost_logger = log_client.logger("cost_estimation_log")
+
         total_uptime_cost = vm_cost_breakdown['uptime'] + disks_cost_breakdown['uptime']
         total_last_day_cost = vm_cost_breakdown['last_day'] + disks_cost_breakdown['last_day']
         total_hourly_cost = vm_cost_breakdown['hourly'] + disks_cost_breakdown['hourly']
@@ -189,12 +262,344 @@ def cost_calculate(project_id):
         except Exception as e:
             print("Exception while logging VM cost %s" % str(e))
 
+    if not only_estimate_burn:
+
+        # If the estimated burn over the next 12 hours will take us over the budget by some multiplier, we will shut
+        # everything down:
+
+        burn_estimate_fraction = float(total_spend + (12 * total_hourly_cost)) / float(budget_amount)
+        projected_burn_exhaustion = (burn_estimate_fraction >= ESTIMATE_PULL_MULTIPLIER)
+        if projected_burn_exhaustion:
+            message_key = message_root_fmt.format("5")
+            print("{}: Project {} Estimated VM burn will exceed budget. Shutting down all VMs".format(message_key, project_id))
+        need_to_act = need_to_act or projected_burn_exhaustion
+
+        #
+        # If we need to act, do it:
+        #
+
+        have_appengine = _check_appengine(project_id)
+        if need_to_act:
+            full_stop_list = _prepare_shutdown_list(compute_inventory)
+            if len(full_stop_list) > 0:
+                print("Project {} turning off VMs".format(project_id))
+                _process_shutdown_list(project_id, full_stop_list)
+            if have_appengine:
+                print("Project {} turning off App Engine".format(project_id))
+                _turn_off_appengine(project_id)
+                _check_appengine(project_id)
+            print("Project {} finished turning off resources".format(project_id))
+            if fraction >= PULL_MULTIPLIER:
+                message_key = message_root_fmt.format("4")
+                print("{}: Project {} pulling billing account".format(message_key, project_id))
+                _pull_billing_account(project_id, project_name)
+                print("Project {} completed pulling billing account".format(project_id))
+        else:
+            billing_on = _check_billing(project_id, project_name)
+            if billing_on:
+                print("Project {} billing enabled: {}".format(project_id, str(billing_on)))
+            print("Project {} fraction {} still in bounds".format(project_id, str(fraction)))
+            num_excess = len(excess_vm_stop_list)
+            if num_excess > 0:
+                print("Project {} turning off {} excess VMs".format(project_id, num_excess))
+                _process_shutdown_list(project_id, excess_vm_stop_list)
+
     return
+
+
+'''
+----------------------------------------------------------------------------------------------
+Check if billing is enabled:
+'''
+
+def _check_billing(project_id, project_name):
+    billing = discovery.build('cloudbilling', 'v1', cache_discovery=False)
+    projects = billing.projects()
+    billing_enabled = _is_billing_enabled(project_name, projects)
+    return billing_enabled
+
+'''
+----------------------------------------------------------------------------------------------
+Pull the billing account:
+'''
+
+def _pull_billing_account(project_id, project_name):
+    billing = discovery.build('cloudbilling', 'v1', cache_discovery=False)
+
+    projects = billing.projects()
+
+    billing_enabled = _is_billing_enabled(project_name, projects)
+
+    if billing_enabled:
+        _disable_billing_for_project(project_id, project_name, projects)
+    else:
+        print('Project {} billing already disabled'.format(project_id))
+    return
+
+'''
+----------------------------------------------------------------------------------------------
+Check if billing is enabled on the project:
+'''
+
+def _is_billing_enabled(project_name, projects):
+    try:
+        res = projects.getBillingInfo(name=project_name).execute()
+        billing_enabled = res['billingEnabled']
+        return billing_enabled
+    except KeyError:
+        print("Check for billing enabled returns key error; billing not enabled.")
+        # If billingEnabled isn't part of the return, billing is not enabled
+        return False
+    except Exception as e:
+        print('Unable to determine if billing is enabled on specified project, assuming billing is enabled {}'.format(str(e)))
+        return True
+
+'''
+----------------------------------------------------------------------------------------------
+Do the actual pull of the billing account:
+'''
+
+def _disable_billing_for_project(project_id, project_name, projects):
+    body = {'billingAccountName': ''}  # Disable billing
+    try:
+        res = projects.updateBillingInfo(name=project_name, body=body).execute()
+        print('Project {} billing response: {}'.format(project_id, json.dumps(res)))
+        print('Project {} billing disabled'.format(project_id))
+    except Exception:
+        print('Project {} failed to disable billing, possibly check permissions'.format(project_id))
+    return
+
+'''
+----------------------------------------------------------------------------------------------
+Determine if compute services are enabled:
+'''
+def _check_compute_services_for_project(project_id):
+    service_u = discovery.build('serviceusage', 'v1', cache_discovery=False)
+
+    s_request = service_u.services().get(name="projects/{}/services/compute.googleapis.com".format(project_id))
+    response = s_request.execute()
+    return response['state'] == "ENABLED"
+
+
+'''
+----------------------------------------------------------------------------------------------
+Return information on all VMs in the project:
+'''
+def _check_compute_engine_inventory_aggregate(service, project_id):
+
+    instance_dict = {}
+    type_dict = {}
+    total_cpus = 0
+
+    request = service.instances().aggregatedList(project=project_id)
+
+    while request is not None:
+        response = request.execute()
+        for zone, instance_scoped_list in response['items'].items():
+            if "warning" in instance_scoped_list and instance_scoped_list["warning"]["code"] == 'NO_RESULTS_ON_PAGE':
+                continue
+            for instance in instance_scoped_list['instances']:
+                total_cpus += _describe_running_instance(project_id, zone.split('/')[-1], service, instance, instance_dict, type_dict)
+        request = service.instances().aggregatedList_next(previous_request=request, previous_response=response)
+
+    return instance_dict, type_dict, total_cpus
+
+'''
+----------------------------------------------------------------------------------------------
+# Describe a running instance:
+'''
+def _describe_running_instance(project_id, zone, compute, item, instance_dict, type_dict):
+
+    cpu_count = 0
+    if item['status'] == 'RUNNING':
+        accel_inventory = []
+        if 'guestAccelerators' in item:
+            for accel in item['guestAccelerators']:
+                type_chunks = accel['acceleratorType'].split('/')
+                accel_entry = {
+                    'count': int(accel['acceleratorCount']),
+                    'zone': type_chunks[-3],
+                    'type': type_chunks[-1]
+                }
+                print("Accelerator: %i %s %s" % (accel_entry['count'], accel_entry['zone'], accel_entry['type']))
+                accel_inventory.append(accel_entry)
+
+        machine_key = item['machineType'].split('/')[-1]
+        instance_info = {'zone': zone,
+                         'name': item['name'],
+                         'status': item['status'],
+                         'created': item['creationTimestamp'],
+                         'started': item['lastStartTimestamp'],
+                         'lastStop': item['lastStopTimestamp'] if 'lastStopTimestamp' in item else None,
+                         'machineType': machine_key,
+                         'firstDiskSize': item['disks'][0]['diskSizeGb'],
+                         'firstDiskKind': item['disks'][0]['kind'],
+                         'firstDiskFirstLicense': item['disks'][0]['licenses'][0].split('/')[-1],
+                         'preemptible': item['scheduling']['preemptible'],
+                         'accelerator_inventory': accel_inventory,
+                         'cpus': 0.0
+                         }
+
+        full_key = (zone, machine_key)
+        if full_key not in type_dict:
+            request = compute.machineTypes().get(project=project_id, zone=zone, machineType=instance_info['machineType'])
+            response = request.execute()
+            machine_info = {'name': response['name'],
+                            'cpus': float(response['guestCpus']),
+                            'memory': int(response['memoryMb']),
+                            'zone': response['zone']
+                           }
+            type_dict[full_key] = machine_info
+            instance_info['cpus'] = float(response['guestCpus'])
+        else:
+            instance_info['cpus'] = type_dict[full_key]['cpus']
+
+        full_key = (zone, machine_key, instance_info['cpus'], instance_info['name'])
+        cpu_count += instance_info['cpus']
+        instance_dict[full_key] = instance_info
+
+    return cpu_count
+
+'''
+----------------------------------------------------------------------------------------------
+Prepare the list of VMs to shut down:
+'''
+
+def _prepare_shutdown_list(compute_inventory, stop_count=None):
+    by_stamp = {}
+    for k, v in compute_inventory.items():
+        result = datetime.datetime.strptime(v['started'], '%Y-%m-%dT%H:%M:%S.%f%z')
+        if result not in by_stamp:
+            tuples_for_stamp = []
+            by_stamp[result] = tuples_for_stamp
+        else:
+            tuples_for_stamp = by_stamp[result]
+        tuples_for_stamp.append(k)
+
+    count = 0
+    retval = []
+    for started in sorted(by_stamp.keys(), reverse=True):
+        print("tuple {}".format(by_stamp[started]))
+        for_stamp = by_stamp[started]
+        for machine_tuple in for_stamp:
+            retval.append(machine_tuple)
+            count += machine_tuple[2]
+            if stop_count is not None and count > stop_count:
+                break
+        if stop_count is not None and count > stop_count:
+            break
+
+    return retval
+
+'''
+----------------------------------------------------------------------------------------------
+Stop the instances that need to be shut down:
+'''
+
+def _process_shutdown_list(project_id, stop_list):
+
+    if len(stop_list) > 0:
+        names_by_zone = {}
+        for zone_and_name in stop_list:
+            zone = zone_and_name[0]
+            if zone not in names_by_zone:
+                names_in_zone = []
+                names_by_zone[zone] = names_in_zone
+            else:
+                names_in_zone = names_by_zone[zone]
+            names_in_zone.append(zone_and_name[1])
+
+        compute = discovery.build('compute', 'v1', cache_discovery=False)
+        instances = compute.instances()
+        for zone, names in names_by_zone.items():
+            _stop_instances(project_id, zone, names, instances)
+    return
+
+
+'''
+----------------------------------------------------------------------------------------------
+Do the actual stop call:
+'''
+
+def _stop_instances(project_id, zone, instance_names, instances):
+
+    if not len(instance_names):
+        print('No running instances were found in zone {}.'.format(zone))
+        return
+
+    for name in instance_names:
+        instances.stop(project=project_id, zone=zone, instance=name).execute()
+        print('Instance stopped successfully: {}'.format(name))
+
+    return
+
+'''
+----------------------------------------------------------------------------------------------
+Find out app engine status:
+'''
+
+def _check_appengine(project_id):
+
+    appengine = discovery.build('appengine', 'v1', cache_discovery=False)
+    apps = appengine.apps()
+
+    # Get the target app's serving status
+    try:
+        target_app = apps.get(appsId=project_id).execute()
+    except HttpError as e:
+        if e.resp.status == 404:
+            print('Project {} does not have App Engine enabled'.format(project_id))
+            return
+        else:
+            raise e
+
+    current_status = target_app['servingStatus']
+
+    print('Project {} App Engine status {}'.format(project_id, str(current_status)))
+
+    return current_status == "SERVING"
+
+'''
+----------------------------------------------------------------------------------------------
+Turn off app engine:
+'''
+
+def _turn_off_appengine(project_id):
+
+    appengine = discovery.build('appengine', 'v1', cache_discovery=False)
+    apps = appengine.apps()
+
+    # Get the target app's serving status
+    target_app = apps.get(appsId=project_id).execute()
+    current_status = target_app['servingStatus']
+
+    # Disable target app, if necessary
+    if current_status == 'SERVING':
+        print('Attempting to disable app {}...'.format(project_id))
+        body = {'servingStatus': 'USER_DISABLED'}
+        apps.patch(appsId=project_id, updateMask='serving_status', body=body).execute()
+
+    return
+
+'''
+----------------------------------------------------------------------------------------------
+Figure out if we are spending before going through extensive calculations
+'''
+
+def are_we_spending(vm_cost_breakdown, disks_cost_breakdown):
+
+    total = 0.0
+    for val in vm_cost_breakdown.values():
+        total += val
+    for val in disks_cost_breakdown.values():
+        total += val
+    return total > 0.0
 
 '''
 ----------------------------------------------------------------------------------------------
 Compute the cost of the given machine:
 '''
+
 def _machine_cost(machine_info, type_dict, vm_pricing_cache, gpu_pricing_cache,
                   cpu_lic_pricing_cache, gpu_lic_pricing_cache, ram_lic_pricing_cache):
 
@@ -309,6 +714,7 @@ def _machine_cost(machine_info, type_dict, vm_pricing_cache, gpu_pricing_cache,
 ----------------------------------------------------------------------------------------------
 Compute the license cost of the given machine:
 '''
+
 def _license_cost(machine_info, license_name, num_cpu, num_gpu, memory_gb, hours,
                   cpu_lic_pricing_cache, gpu_lic_pricing_cache, ram_lic_pricing_cache):
 
@@ -447,17 +853,6 @@ def _disk_cost(disk, disk_pricing_cache):
 
 '''
 ----------------------------------------------------------------------------------------------
-Determine if compute services are enabled:
-'''
-def _check_compute_services_for_project(project_id):
-    service_u = discovery.build('serviceusage', 'v1', cache_discovery=False)
-
-    s_request = service_u.services().get(name="projects/{}/services/compute.googleapis.com".format(project_id))
-    response = s_request.execute()
-    return response['state'] == "ENABLED"
-
-'''
-----------------------------------------------------------------------------------------------
 Return information on all persistent disks in the project:
 '''
 def _check_persistent_disk_inventory_aggregate(service, project_id):
@@ -490,85 +885,7 @@ def _check_persistent_disk_inventory_aggregate(service, project_id):
         request = service.disks().aggregatedList_next(previous_request=request, previous_response=response)
     return disk_list
 
-'''
-----------------------------------------------------------------------------------------------
-Return information on all VMs in the project:
-'''
-def _check_compute_engine_inventory_aggregate(service, project_id):
 
-    instance_dict = {}
-    type_dict = {}
-    total_cpus = 0
-
-    request = service.instances().aggregatedList(project=project_id)
-
-    while request is not None:
-        response = request.execute()
-        for zone, instance_scoped_list in response['items'].items():
-            if "warning" in instance_scoped_list and instance_scoped_list["warning"]["code"] == 'NO_RESULTS_ON_PAGE':
-                continue
-            for instance in instance_scoped_list['instances']:
-                total_cpus += _describe_running_instance(project_id, zone.split('/')[-1], service, instance, instance_dict, type_dict)
-        request = service.instances().aggregatedList_next(previous_request=request, previous_response=response)
-
-    return instance_dict, type_dict, total_cpus
-
-
-'''
-----------------------------------------------------------------------------------------------
-# Describe a running instance:
-'''
-def _describe_running_instance(project_id, zone, compute, item, instance_dict, type_dict):
-
-    cpu_count = 0
-    if item['status'] == 'RUNNING':
-        accel_inventory = []
-        if 'guestAccelerators' in item:
-            for accel in item['guestAccelerators']:
-                type_chunks = accel['acceleratorType'].split('/')
-                accel_entry = {
-                    'count': int(accel['acceleratorCount']),
-                    'zone': type_chunks[-3],
-                    'type': type_chunks[-1]
-                }
-                print("Accelerator: %i %s %s" % (accel_entry['count'], accel_entry['zone'], accel_entry['type']))
-                accel_inventory.append(accel_entry)
-
-        machine_key = item['machineType'].split('/')[-1]
-        instance_info = {'zone': zone,
-                         'name': item['name'],
-                         'status': item['status'],
-                         'created': item['creationTimestamp'],
-                         'started': item['lastStartTimestamp'],
-                         'lastStop': item['lastStopTimestamp'] if 'lastStopTimestamp' in item else None,
-                         'machineType': machine_key,
-                         'firstDiskSize': item['disks'][0]['diskSizeGb'],
-                         'firstDiskKind': item['disks'][0]['kind'],
-                         'firstDiskFirstLicense': item['disks'][0]['licenses'][0].split('/')[-1],
-                         'preemptible': item['scheduling']['preemptible'],
-                         'accelerator_inventory': accel_inventory,
-                         'cpus': 0.0
-                         }
-
-        full_key = (zone, machine_key)
-        if full_key not in type_dict:
-            request = compute.machineTypes().get(project=project_id, zone=zone, machineType=instance_info['machineType'])
-            response = request.execute()
-            machine_info = {'name': response['name'],
-                            'cpus': float(response['guestCpus']),
-                            'memory': int(response['memoryMb']),
-                            'zone': response['zone']
-                           }
-            type_dict[full_key] = machine_info
-            instance_info['cpus'] = float(response['guestCpus'])
-        else:
-            instance_info['cpus'] = type_dict[full_key]['cpus']
-
-        full_key = (zone, machine_key, instance_info['cpus'], instance_info['name'])
-        cpu_count += instance_info['cpus']
-        instance_dict[full_key] = instance_info
-
-    return cpu_count
 
 '''
 ----------------------------------------------------------------------------------------------
@@ -841,6 +1158,89 @@ def _ram_lic_cost_sql(os_key, ram_lic_table_name, lic_key_mapping):
 
 '''
 ----------------------------------------------------------------------------------------------
+Calculate egress charges
+'''
+def _calc_egress(table_name, project_id):
+    sql = _egress_sql(table_name, project_id)
+    results = _bq_harness_with_result(sql, False)
+    data_move_costs = 0.0
+    if results is not None:
+        for row in results:
+            data_move_costs += row.totalCost
+    return data_move_costs
+
+'''
+----------------------------------------------------------------------------------------------
+Download SQL
+'''
+def _egress_sql(table_name, project_id):
+
+    # Download APAC = 1F8B-71B0-3D1B
+    # Download Australia = 9B2D-2B7D-FA5C
+    # Download China = 4980-950B-BDA6
+    # Download Worldwide Destinations (excluding Asia & Australia) = 22EB-AAE8-FBCD
+    #
+
+    # Inter-region GCP Storage egress within NA
+    #    * gsutil cp from us-west bucket to a VM running in us-central
+    #    * gsutil cp from us-west bucket to a bucket in us-east
+    #    * Both operations cost: 2.739579800516365 gibibyte -> $0.0224 each
+    # Download Worldwide Destinations (excluding Asia & Australia):
+    #    * gsutil cp from from us-west bucket to local laptop
+    #    * Operation cost : 2.7395823346450907 gibibyte -> $0.209
+    # All operations took place on Sunday evening and appeared in the BQ table ~ 1 PM Monday
+    # In another test, download charges appeared in the budget total sent to cloud function (4 AM PST Tuesday)
+    # approx 13 hours after the operation (2-3 PM PST Monday). Appeared in BQ table at 4:40 AM PST Tuesday.
+    #  "GCP Storage egress between"
+
+    sql = '''
+        WITH
+          t1 AS (
+          SELECT
+            project.id AS project_id,
+            project.name AS project_name,
+            service.description AS service,
+            sku.description AS sku,
+            cost,
+            usage.amount AS usage_amount,
+            usage.unit AS usage_unit,
+            invoice.month AS invoice_yyyymm
+          FROM
+            `{0}`
+          WHERE
+            project.id = "{1}" AND (sku.description LIKE "%ownload%" OR sku.description LIKE "%gress%")),
+          t2 AS (
+          SELECT
+            project_id,
+            project_name,
+            service,
+            sku,
+            SUM(cost) AS totalCost,
+            SUM(usage_amount) AS totalUsage,
+            usage_unit,
+            invoice_yyyymm
+          FROM
+            t1
+          GROUP BY
+            1,
+            2,
+            3,
+            4,
+            7,
+            8)
+        SELECT
+          *
+        FROM
+          t2
+        ORDER BY
+          totalCost DESC
+
+        '''.format(table_name, project_id)
+    return sql
+
+
+'''
+----------------------------------------------------------------------------------------------
 Use to run queries where we want to get the result back to use (not write into a table)
 '''
 def _bq_harness_with_result(sql, do_batch):
@@ -875,3 +1275,5 @@ def _bq_harness_with_result(sql, do_batch):
     results = query_job.result()
 
     return results
+
+
