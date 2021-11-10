@@ -31,9 +31,8 @@ in project "B" trigger alerts with emails or text messages to monitor the system
 
 This function was developed before Google allowed custom ranges to be specified for budgets, and assumes the
 budget alert is monthly, but that the budget set specifies the "all-time" spending for the project. Thus, it
-keeps state in a bucket in project "B" that you specify. One gotcha is that it assumes an empty file for project "A"
-already exists in the bucket. (still a to-do).  Note that each project has a separate file, since the function
-is being triggered by each separate project, and we want to avoid race conditions. (Note the function usuall takes
+keeps state in a bucket in project "B" that you specify. Note that each project has a separate file, since the function
+is being triggered by each separate project, and we want to avoid race conditions. (Note the function usually takes
 10-20 seconds to run for each project it processes). With enough projects to monitor, it might fall behind (?). This
 has not been explored.
 
@@ -54,8 +53,10 @@ a configurable value, the function will shut down VMs in a LIFO fashion to get b
 Finally, one of the big shortcomings of the above system is that the published spending numbers can lag actual
 expense by 12 hours (give or take). So shutting a project down based on stale numbers may be too late to avoid
 unexpected charges. Thus, this function also estimates the current burn rate for running VMs and persistent storage
-each time the function runs (e.g. every 20 minutes). If the system detects that existing reported spending, plus
-12 hours of this estimated burn, will exceed the budget by a specified multiplier, it will shut down all running VMs.
+each time the function runs (e.g. every 20 minutes). The system estimates the total spending up to the current
+instant, compares that to what has been reported in the Google BQ table that records charges, and boosts the
+amount spent by the difference between the two. Note that at the moment, this is only done for VM and persistent
+disks. AppEngine, and all sorts of other services, are not estimated yet.
 
 To achieve this, a set of BigQuery tables need to be created in project "B" that quantify the costs associated
 with running VMs. The seed for these tables is the SKU export table that Google will create if this export is
@@ -65,23 +66,19 @@ Note this routine uses the standard method used by the ISB-CGC ETL system, where
 live in a cloud configuration bucket. Usually those scripts run on a VM, but the "-from-desktop" bit means this
 script is set up to run on your local laptop, usually after running "gcloud auth application-default login"
 to get the script to run locally using personal credentials. (Remember to run "gcloud auth application-default revoke"
-when done to get back to normal service account-driven script execution.
+when done to get back to normal service account-driven script execution.)
 
 Quantifying this spending exactly is a work in progress, and currently involves educated guesswork as to how
-a CPU tag maps to specific CPU and RAM SKUs. E.g., it appears that "c2-standard" might map to "Compute optimized Core"
+a VM tag maps to specific VM and RAM SKUs. E.g., it appears that "c2-standard" might map to "Compute optimized Core"
 and "Compute optimized Ram". But only a small set of the search space has been confirmed; the rest is educated
 guessing.
 
 The problem is even more complex for OS licensing, especially for Windows machines. The system is currently
-configured to try and handle the various cases (e.g. OS licensing costs based on GPU count). All pull requests
-to improve the mapping tables are welcome.
+configured to try and handle the various cases (e.g. OS licensing costs based on GPU count, system RAM, etc).
+All pull requests to improve the mapping tables are welcome.
 
-Finally, these price estimates do not include tiered pricing and discounts (or external IP charges, yet). It
-is intended to be conservative. But these enhancements would be useful.
+Finally, these price estimates do not include tiered pricing and sustained use discounts (or external IP charges, yet).
+It is intended to be conservative. But these enhancements would be useful.
 
 Note that the cloud function can be triggered from an HTTP entry point if you just want to run the realtime
 estimates. To track a budget and (maybe) shut down resources, the Pub/Sub entry is the one to use.
-
-
-
-
