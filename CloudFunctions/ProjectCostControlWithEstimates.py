@@ -85,6 +85,30 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
     message_root_fmt = "EXTERNAL BUDGET ALERT {}" # USE this to trigger monitoring alerts.
 
     #
+    # Get the states for the budget:
+    #
+
+    now_time = datetime.datetime.now(datetime.timezone.utc)
+    now_hour = datetime.datetime(now_time.year, now_time.month, now_time.day, hour=now_time.hour, tzinfo=now_time.tzinfo)
+
+    storage_client = storage.Client()
+    try:
+        bucket = storage_client.get_bucket(STATE_BUCKET)
+    except:
+        raise Exception("State bucket does not exist") # Better yet, create it and keep going
+
+    burn_blob = "{}_burn_state.json".format(project_id)
+    blob = bucket.blob(burn_blob)
+    burn_blob_str = blob.download_as_string() if blob.exists() else b''
+    if burn_blob_str == b'':
+        burn_state = {"vm_instances" : {},
+                      "pdisks": {},
+                      "inventory_time": None
+                     }
+    else:
+        burn_state = json.loads(burn_blob_str)
+
+    #
     # If we are not just doing a burn estimate, we get here via a pubsub message about every 20 minutes all
     # month long. We don't really care about the monthly billing here, we care about the cumulative amount
     # over several months which is what will cause a shutdown. But if we just want a burn estimate, we can
@@ -94,6 +118,10 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
     need_to_act = False
     fraction  = 0.0
     total_spend = 0.0
+    additional_fees = 0.0
+    budget_state = None
+    message_state = None
+    week_num = None
     project_name = 'projects/{}'.format(project_id)
 
     log_client = glog.Client(project=project_id)
@@ -108,10 +136,7 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
         #
 
         state_blob = "{}_state.json".format(project_id)
-        week_num = datetime.datetime.now().strftime("%V")
-
-        storage_client = storage.Client()
-        bucket = storage_client.get_bucket(STATE_BUCKET)
+        week_num = now_time.strftime("%V")
 
         blob = bucket.blob(state_blob)
         blob_str = blob.download_as_string() if blob.exists() else b''
@@ -144,15 +169,162 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
                 message_state[message_key] = week_num
 
         #
+        # Stash the latest cost data and message status back in the bucket before we wander off and do things, just in
+        # case everything goes nuts:
+        #
+
+        # Seems we get a checksum complaint if we don't reinitialize the blob:
+        blob = bucket.blob(state_blob)
+        blob.upload_from_string(json.dumps(budget_super_state, indent=4, sort_keys=True))
+
+    #
+    # We want to limit the number of instances that can be run without having to set a quota. We also want to
+    # calculate the current burn rate. Both require an inventory of all VMs in the project:
+    #
+
+    excess_vm_stop_list = []
+    compute_inventory = {}
+    disk_inventory = {}
+    all_vm_dict = {}
+    all_pd_dict = {}
+    is_enabled = _check_compute_services_for_project(project_id)
+    if is_enabled:
+        compute = discovery.build('compute', 'v1', cache_discovery=False)
+        compute_inventory, type_dict, total_cpus = _check_compute_engine_inventory_aggregate(compute, project_id)
+        print("what about deleting VMs?")
+        all_vm_dict = burn_state['vm_instances']
+        for k, v in compute_inventory.items():
+            _build_vm_inventory(v, type_dict, now_hour, now_time, all_vm_dict)
+
+        print("Project {} cpu count {}".format(project_id, total_cpus))
+        if (not only_estimate_burn) and (total_cpus > MAX_CPUS):
+            message_key = message_root_fmt.format("3")
+            shutdown = total_cpus - MAX_CPUS
+            print("{}: Project {} is over CPU limit: {} Shutting down {}".format(message_key, project_id, total_cpus, shutdown))
+            excess_vm_stop_list = _prepare_shutdown_list(compute_inventory, shutdown)
+
+        all_pd_dict = burn_state['pdisks']
+        disk_inventory = _check_persistent_disk_inventory_aggregate(compute, project_id)
+        for disk in disk_inventory:
+            _build_pd_inventory(disk, now_hour, now_time, all_pd_dict)
+
+    else:
+        type_dict = None
+        compute = None
+        print("Project {} does not have compute enabled".format(project_id))
+
+    #
+    # With the VM inventory and disk inventories, we now gather up sku information, we run an estimate of current VM burn rate:
+    #
+
+    vm_pricing_cache = {}
+    gpu_pricing_cache = {}
+    pd_pricing_cache = {}
+    cpu_lic_pricing_cache = {}
+    gpu_lic_pricing_cache = {}
+    ram_lic_pricing_cache = {}
+
+    vm_count = 0
+    if is_enabled:
+        for k, v in compute_inventory.items():
+            vm_dict = all_vm_dict[v['id']]
+            _gather_vm_skus(v, vm_pricing_cache, gpu_pricing_cache, vm_dict)
+            _gather_license_skus(v, cpu_lic_pricing_cache, gpu_lic_pricing_cache, ram_lic_pricing_cache, vm_dict)
+            vm_count += 1
+
+        for disk in disk_inventory:
+            pd_dict = all_pd_dict[disk['id']]
+            _gather_disk_sku(disk, pd_pricing_cache, pd_dict)
+
+        #
+        # Figure out the burn rate:
+        #
+
+        usage_hours = []
+        for i in range(13):
+            usage_hours.append((now_hour - datetime.timedelta(hours=i)).strftime('%Y-%m-%dT%H%z'))
+
+        sku_desc = {}
+        master_chart = {}
+        for clock_time in usage_hours:
+            cost_per_sku = {}
+            for k, vm_dict in all_vm_dict.items():
+                minutes_running = vm_dict["usage"][clock_time]
+                machine_cost = _core_and_ram_and_gpu_cost(minutes_running/60 , vm_dict, cost_per_sku)
+                _calc_licensing_cost(minutes_running/60, vm_dict, cost_per_sku)
+            for k, pd_dict in all_pd_dict.items():
+                minutes_running = pd_dict["usage"][clock_time]
+                dc = _calc_disk_cost(minutes_running/60, pd_dict, cost_per_sku)
+            for k, v in cost_per_sku.items():
+                if clock_time in master_chart:
+                    sku_records = master_chart[clock_time]
+                else:
+                    sku_records = {}
+                    master_chart[clock_time] = sku_records
+                if k in sku_records:
+                    sku_record = sku_records[k]
+                else:
+                    sku_record = {"calc": 0.0, "goog": 0.0}
+                    sku_records[k] = sku_record
+                sku_record["calc"] += v
+
+
+        chist = _get_charge_history_for_sku(COST_BQ, project_id, .00001, 4)
+        for k, hist in chist.items():
+            for dicto in hist:
+                goog_time = dicto["usage_start_time"].strftime('%Y-%m-%dT%H%z')
+                if goog_time in master_chart:
+                    sku_records = master_chart[goog_time]
+                else:
+                    sku_records = {}
+                    master_chart[goog_time] = sku_records
+                if k in sku_records:
+                    sku_record = sku_records[k]
+                else:
+                    sku_record = {"calc": 0.0, "goog": 0.0}
+                    sku_records[k] = sku_record
+
+                sku_record["goog"] += dicto["total_cost"]
+                if k not in sku_desc:
+                    sku_desc[k] = dicto['sku_description']
+
+
+        for clock_time, sku_records in master_chart.items():
+            for sku, record in sku_records.items():
+                if (record["calc"] != 0) or (record["goog"] != 0):
+                    diff = record["calc"] - record["goog"]
+                    print("{} {} ({}) calc: {} google: {} (delta: {})".format(clock_time, sku, sku_desc[sku],
+                                                                              record["calc"], record["goog"],
+                                                                              str(round(diff, 5))))
+                    if diff > 0:
+                        additional_fees += diff
+
+            print("-------------------------------------------------------------------------------------")
+
+        print("add {} to the current Google reported spending".format(round(additional_fees, 2)))
+
+    #
+    # Save the instance state:
+    #
+
+    # Seems we get a checksum complaint if we don't reinitialize the blob:
+    blob = bucket.blob(burn_blob)
+    blob.upload_from_string(json.dumps(burn_state, indent=4, sort_keys=True))
+
+    if not only_estimate_burn:
+
+        #
         # Sum up all months of expenses:
         #
 
         total_spend = 0
         for month, cost_amount in budget_state.items():
             total_spend += cost_amount
+
+        total_spend += additional_fees
         fraction = float(total_spend) / float(budget_amount)
 
-        message = "Project: {} Budget: {} Spent: {:.2f} Fraction: {:.4f}".format(project_id, budget_amount, total_spend, fraction)
+        message = "Project: {} Budget: ${} Charges: ${:.2f} (including estimated additional charges to come: ${:.2f}) Fraction: {:.4f}".format(project_id, budget_amount, total_spend, additional_fees, fraction)
         cost_logger.log_text(message)
 
         need_to_act = (fraction >= 1.0)
@@ -163,116 +335,6 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
             if fire_off:
                 print("{}: Project {} is now over budget! fraction {}".format(message_key, project_id, str(fraction)))
                 message_state[message_key] = week_num
-
-        #
-        # Stash the latest cost data and message status back in the bucket before we wander off and do things, just in
-        # case everything goes nuts:
-        #
-
-        # Seems we get a checksum complaint if we don't reinitialize the blob:
-        blob = bucket.blob(state_blob)
-        blob.upload_from_string(json.dumps(budget_super_state))
-
-    #
-    # We want to limit the number of instances that can be run without having to set a quota. We also want to
-    # calculate the current burn rate. Both require an inventory of all VMs in the project:
-    #
-
-    excess_vm_stop_list = []
-    compute_inventory = {}
-    is_enabled = _check_compute_services_for_project(project_id)
-    if is_enabled:
-        compute = discovery.build('compute', 'v1', cache_discovery=False)
-        compute_inventory, type_dict, total_cpus = _check_compute_engine_inventory_aggregate(compute, project_id)
-        for k, v in compute_inventory.items():
-            print("Project {} instance {} info {}".format(project_id, str(k), json.dumps(v)))
-        print("Project {} cpu count {}".format(project_id, total_cpus))
-        if (not only_estimate_burn) and (total_cpus > MAX_CPUS):
-            message_key = message_root_fmt.format("3")
-            shutdown = total_cpus - MAX_CPUS
-            print("{}: Project {} is over CPU limit: {} Shutting down {}".format(message_key, project_id, total_cpus, shutdown))
-            excess_vm_stop_list = _prepare_shutdown_list(compute_inventory, shutdown)
-    else:
-        type_dict = None
-        compute = None
-        print("Project {} does not have compute enabled".format(project_id))
-
-
-    #
-    # With the VM inventory, we run an estimate of current VM burn rate:
-    #
-
-    vm_pricing_cache = {}
-    gpu_pricing_cache = {}
-    pd_pricing_cache = {}
-    cpu_lic_pricing_cache = {}
-    gpu_lic_pricing_cache = {}
-    ram_lic_pricing_cache = {}
-
-    vm_cost_breakdown = {'uptime': 0.0,
-                         'last_day': 0.0,
-                         'hourly': 0.0
-                         }
-    disks_cost_breakdown = {'uptime': 0.0,
-                            'last_day': 0.0,
-                            'hourly': 0.0
-                            }
-    vm_count = 0
-    if is_enabled:
-        for k, v in compute_inventory.items():
-            machine_breakdown = _machine_cost(v, type_dict, vm_pricing_cache, gpu_pricing_cache,
-                                              cpu_lic_pricing_cache, gpu_lic_pricing_cache, ram_lic_pricing_cache)
-            vm_cost_breakdown['uptime'] += machine_breakdown['uptime']
-            vm_cost_breakdown['last_day'] += machine_breakdown['last_day']
-            vm_cost_breakdown['hourly'] += machine_breakdown['hourly']
-            vm_count += 1
-        disk_inventory = _check_persistent_disk_inventory_aggregate(compute, project_id)
-        for disk in disk_inventory:
-            disk_cost_breakdown = _disk_cost(disk, pd_pricing_cache)
-            disks_cost_breakdown['uptime'] += disk_cost_breakdown['uptime']
-            disks_cost_breakdown['last_day'] += disk_cost_breakdown['last_day']
-            disks_cost_breakdown['hourly'] += disk_cost_breakdown['hourly']
-
-    #
-    # Actually figure out the burn rate if money is being spent:
-    #
-
-    total_hourly_cost = 0.0
-    if are_we_spending(vm_cost_breakdown, disks_cost_breakdown):
-
-        total_uptime_cost = vm_cost_breakdown['uptime'] + disks_cost_breakdown['uptime']
-        total_last_day_cost = vm_cost_breakdown['last_day'] + disks_cost_breakdown['last_day']
-        total_hourly_cost = vm_cost_breakdown['hourly'] + disks_cost_breakdown['hourly']
-        try:
-            print("Full uptime vm costs: vm cost %f disk cost %f total cost: %f" %
-                  (vm_cost_breakdown['uptime'], disks_cost_breakdown['uptime'], total_uptime_cost))
-            print("Last day vm costs: vm cost %f disk cost %f total cost: %f" %
-                  (vm_cost_breakdown['last_day'], disks_cost_breakdown['last_day'], total_last_day_cost))
-            print("Current hourly burn rates: vm count = %i; vm cost = %f; disk cost = %f; total cost = %f" %
-                  (vm_count, vm_cost_breakdown['hourly'], disks_cost_breakdown['hourly'], total_hourly_cost))
-            print("Projected cost next six hours: vm count = %i; vm cost = %f; disk cost = %f; total cost = %f" %
-                  (vm_count, 6.0 * vm_cost_breakdown['hourly'], 6.0 * disks_cost_breakdown['hourly'], 6.0 * total_hourly_cost))
-            print("Projected cost next 12 hours: vm count = %i; vm cost = %f; disk cost = %f; total cost = %f" %
-                  (vm_count, 12.0 * vm_cost_breakdown['hourly'], 12.0 * disks_cost_breakdown['hourly'], 12.0 * total_hourly_cost))
-            print("Projected cost next 24 hours: vm count = %i; vm cost = %f; disk cost = %f; total cost = %f" %
-                  (vm_count, 24.0 * vm_cost_breakdown['hourly'], 24.0 * disks_cost_breakdown['hourly'], 24.0 * total_hourly_cost))
-
-            cost_logger.log_text("Current hourly burn rates: vm cost: %f disk cost: %f total cost: %f" %
-                                 (vm_cost_breakdown['hourly'], disks_cost_breakdown['hourly'], total_hourly_cost))
-        except Exception as e:
-            print("Exception while logging VM cost %s" % str(e))
-
-    if not only_estimate_burn:
-
-        # If the estimated burn over the next 12 hours will take us over the budget by some multiplier, we will shut
-        # everything down:
-
-        burn_estimate_fraction = float(total_spend + (12 * total_hourly_cost)) / float(budget_amount)
-        projected_burn_exhaustion = (burn_estimate_fraction >= ESTIMATE_PULL_MULTIPLIER)
-        if projected_burn_exhaustion:
-            message_key = message_root_fmt.format("5")
-            print("{}: Project {} Estimated VM burn will exceed budget. Shutting down all VMs".format(message_key, project_id))
-        need_to_act = need_to_act or projected_burn_exhaustion
 
         #
         # If we need to act, do it:
@@ -306,6 +368,105 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
 
     return
 
+
+
+'''
+----------------------------------------------------------------------------------------------
+Build up the persistent disk inventory
+'''
+
+def _build_pd_inventory(disk, now_hour, now_time, all_pd_dict):
+    #
+    # pull per-instance record out of the persistent state, or create it:
+    #
+    if disk['id'] in all_pd_dict:
+        pd_dict = all_pd_dict[disk['id']]
+    else:
+        pd_dict = {
+            "id": disk['id'],
+            "gb_size": disk['size'],
+            "pd_sku": None,
+            "usage": {}
+        }
+        all_pd_dict[disk['id']] = pd_dict
+    pd_dict['usage'] = _fill_time_series(now_hour, now_time, disk['created'].strftime('%Y-%m-%dT%H:%M:%S.%f%z'),
+                                         pd_dict['usage'])
+    return
+
+'''
+----------------------------------------------------------------------------------------------
+Build up the VM inventory
+'''
+
+def _build_vm_inventory(machine_info, type_dict, now_hour, now_time, all_vm_dict):
+    #
+    # pull per-instance record out of the persistent state, or create it:
+    #
+    if machine_info['id'] in all_vm_dict:
+        vm_dict = all_vm_dict[machine_info['id']]
+    else:
+        vm_dict = {
+            "id": machine_info['id'],
+            "preempt": machine_info['preemptible'],
+            "machine_type": machine_info['machineType'],
+            "machine_zone": machine_info['zone'],
+            "memory_gb": type_dict[(machine_info['zone'], machine_info['machineType'])]['memory'] / 1024,
+            "region": '-'.join(machine_info['zone'].split('-')[0:-1]),
+            "accel": machine_info['accelerator_inventory'],
+            "skus": {
+                "vm_sku": None,
+                "ram_sku": None,
+                "gpu_sku": None,
+                "lic_sku": None,
+                "cpu_os_lic_sku": None,
+                "gpu_os_lic_sku": None,
+                "ram_os_lic_sku": None
+            },
+            "usage": {}
+        }
+        all_vm_dict[machine_info['id']] = vm_dict
+    #
+    # For the VM, fill in the runtime for hour slots back to the beginning of our series, or to the last
+    # start time of the VM, whichever is later. Don't touch older slots, if they exist. Make it so we build
+    # the whole series from scratch the first time, and also that we throw out old entries we don't care
+    # about anymore:
+    #
+
+    vm_dict['usage'] = _fill_time_series(now_hour, now_time, machine_info['started'], vm_dict['usage'])
+    return
+
+'''
+----------------------------------------------------------------------------------------------
+Fill in a time series
+'''
+
+def _fill_time_series(now_hour, now_time, start_time_str, old_time_series):
+    #
+    # For the VM/PD, fill in the runtime for hour slots back to the beginning of our series, or to the last
+    # start time of the VM, whichever is later. Don't touch older slots, if they exist. Make it so we build
+    # the whole series from scratch the first time, and also that we throw out old entries we don't care
+    # about anymore:
+    #
+
+    usage_hours = []
+    for i in range(13):
+        usage_hours.append((now_hour - datetime.timedelta(hours=i)).strftime('%Y-%m-%dT%H%z'))
+
+    new_time_series = {}
+    start_time = datetime.datetime.strptime(start_time_str, '%Y-%m-%dT%H:%M:%S.%f%z')
+    for hour_str in usage_hours:
+        hour = datetime.datetime.strptime(hour_str, '%Y-%m-%dT%H%z')
+        next_hour = hour + datetime.timedelta(hours=1)
+        if hour > start_time:
+            if now_time > next_hour:
+                new_time_series[hour_str] = 60
+            else:
+                new_time_series[hour_str] = (now_time - now_hour).total_seconds() / 60
+        elif start_time < next_hour:
+            new_time_series[hour_str] = (next_hour - start_time).total_seconds() / 60
+        elif hour in old_time_series:
+            new_time_series[hour_str] = old_time_series[hour_str]
+    return new_time_series
 
 '''
 ----------------------------------------------------------------------------------------------
@@ -426,6 +587,7 @@ def _describe_running_instance(project_id, zone, compute, item, instance_dict, t
 
         machine_key = item['machineType'].split('/')[-1]
         instance_info = {'zone': zone,
+                         'id': item['id'],
                          'name': item['name'],
                          'status': item['status'],
                          'created': item['creationTimestamp'],
@@ -479,7 +641,6 @@ def _prepare_shutdown_list(compute_inventory, stop_count=None):
     count = 0
     retval = []
     for started in sorted(by_stamp.keys(), reverse=True):
-        print("tuple {}".format(by_stamp[started]))
         for_stamp = by_stamp[started]
         for machine_tuple in for_stamp:
             retval.append(machine_tuple)
@@ -597,126 +758,56 @@ def are_we_spending(vm_cost_breakdown, disks_cost_breakdown):
 
 '''
 ----------------------------------------------------------------------------------------------
-Compute the cost of the given machine:
+Gather up the SKU info for a VM
 '''
 
-def _machine_cost(machine_info, type_dict, vm_pricing_cache, gpu_pricing_cache,
-                  cpu_lic_pricing_cache, gpu_lic_pricing_cache, ram_lic_pricing_cache):
+def _gather_vm_skus(machine_info, vm_pricing_cache, gpu_pricing_cache, vm_dict):
 
-    #
-    # For each machine, calculate the time it has been up since started.
-    #
-    start_time = machine_info['started']
-    if ":" == start_time[-3:-2]:
-        start_time = start_time[:-3] + start_time[-2:]
-    start_time_obj = datetime.datetime.strptime(start_time, '%Y-%m-%dT%H:%M:%S.%f%z')
-
-
-    last_stop = machine_info['lastStop']
-    if last_stop is not None:
-        if ":" == last_stop[-3:-2]:
-            last_stop = last_stop[:-3] + last_stop[-2:]
-        last_stop_obj = datetime.datetime.strptime(last_stop, '%Y-%m-%dT%H:%M:%S.%f%z')
-
-    now_time = datetime.datetime.now(datetime.timezone.utc)
-    uptime = now_time - start_time_obj
-
-    hour_dict = {}
-    uptime_hours = uptime.total_seconds() / (60 * 60)
-    hour_dict['uptime'] = uptime_hours
-
-    hour_dict['last_day'] = 24 if uptime_hours > 24 else uptime_hours
-    hour_dict['hourly'] = 1
-
-    license_name = machine_info['firstDiskFirstLicense']
-    preempt = machine_info['preemptible']
-
-    machine_type = machine_info['machineType']
-    machine_zone = machine_info['zone']
-    memory_size = type_dict[(machine_zone, machine_type)]['memory']
-
-    memory_gb = memory_size / 1024
-    cpus = machine_info['cpus']
-    print(machine_info['name'], cpus)
-
-    num_gpu = len(machine_info['accelerator_inventory'])
-
-    cost_breakdown = {}
-    machine_type_only = '-'.join(machine_type.split('-')[0:2])
-    region = '-'.join(machine_zone.split('-')[0:-1])
-    key = (machine_type_only, region, preempt)
+    machine_type_only = '-'.join(vm_dict["machine_type"].split('-')[0:2])
+    key = (machine_type_only, vm_dict['region'], vm_dict["preempt"])
 
     if key in vm_pricing_cache:
         price_lineitem = vm_pricing_cache[key]
     else:
-        price_lineitem = _pull_vm_pricing(machine_type_only, preempt, region, CPU_PRICES, RAM_PRICES, KEY_MAP)
+        price_lineitem = _pull_vm_pricing(machine_type_only, vm_dict["preempt"], vm_dict['region'], CPU_PRICES, RAM_PRICES, KEY_MAP)
         if price_lineitem is not None:
             vm_pricing_cache[key] = price_lineitem
         else:
             raise Exception("No VM pricing found")
 
-    for interval, hours in hour_dict.items():
-        machine_cost = 0.0
-        core_per_hour = 0.0
-        gb_per_hour = 0.0
-        if price_lineitem is not None:
-            no_calc = False
-            if price_lineitem[4] == "HOUR":
-                core_per_hour = price_lineitem[3]
-            else:
-                no_calc = True
-            if price_lineitem[6] is None:
-                gb_per_hour = 0.0
-            elif price_lineitem[6] == "GIBIBYTE_HOUR":
-                gb_per_hour = price_lineitem[5]
-            else:
-                no_calc = True
-            if not no_calc:
-                # Machine type includes the CPU count. Do not multiply by CPU count!
-                machine_cost = (hours * core_per_hour) + (hours * memory_gb * gb_per_hour)
-            else:
-                raise Exception("unexpected pricing units: {} {}".format(price_lineitem[4], price_lineitem[6]))
+    vm_dict["skus"]["vm_sku"] = {price_lineitem[7]: price_lineitem}
+    vm_dict["skus"]["ram_sku"] = {price_lineitem[8]: price_lineitem}
+
+    all_accel = {}
+
+    for accel_entry in machine_info['accelerator_inventory']:
+        gpu_key = (accel_entry['type'], vm_dict['region'], vm_dict["preempt"])
+        if gpu_key in gpu_pricing_cache:
+            gpu_price_lineitem = gpu_pricing_cache[gpu_key]
         else:
-            raise Exception("machine key not present: {}".format(key))
-
-        #
-        # Calculate license costs
-        #
-
-        lic_cost = _license_cost(machine_info, license_name, cpus, num_gpu, memory_gb, hours,
-                                 cpu_lic_pricing_cache, gpu_lic_pricing_cache, ram_lic_pricing_cache)
-        machine_cost += lic_cost
-
-        accel_cost = 0.0
-        for accel_entry in machine_info['accelerator_inventory']:
-            gpu_key = (accel_entry['type'], region, preempt)
-            if gpu_key in gpu_pricing_cache:
-                gpu_price_lineitem = gpu_pricing_cache[gpu_key]
-            else:
-                gpu_price_lineitem = _pull_gpu_pricing(accel_entry['type'], preempt, region, GPU_PRICES, GPU_KEY_MAP)
-                if gpu_price_lineitem is not None:
-                    gpu_pricing_cache[gpu_key] = gpu_price_lineitem
-
+            gpu_price_lineitem = _pull_gpu_pricing(accel_entry['type'], vm_dict["preempt"], vm_dict['region'], GPU_PRICES, GPU_KEY_MAP)
             if gpu_price_lineitem is not None:
-                if gpu_price_lineitem[4] == "HOUR":
-                    accel_per_hour = gpu_price_lineitem[3]
-                    accel_cost += hours * accel_per_hour * accel_entry['count']
-                else:
-                    raise Exception("unexpected pricing units: {}".format(gpu_price_lineitem[4]))
+                gpu_pricing_cache[gpu_key] = gpu_price_lineitem
             else:
-                raise Exception("gpu key not present: {}".format(gpu_key))
+                raise Exception("GPU pricing not found: {}".format(gpu_key))
+        if gpu_key not in all_accel:
+            all_accel[gpu_key] = gpu_price_lineitem
 
-        cost_breakdown[interval] = machine_cost + accel_cost
-
-    return cost_breakdown
+    vm_dict["skus"]["gpu_sku"] = all_accel
+    return
 
 '''
 ----------------------------------------------------------------------------------------------
-Compute the license cost of the given machine:
+Get the license SKU info for a machine:
 '''
 
-def _license_cost(machine_info, license_name, num_cpu, num_gpu, memory_gb, hours,
-                  cpu_lic_pricing_cache, gpu_lic_pricing_cache, ram_lic_pricing_cache):
+def _gather_license_skus(machine_info,
+                         cpu_lic_pricing_cache, gpu_lic_pricing_cache, ram_lic_pricing_cache,
+                         vm_dict):
+
+    license_name = machine_info['firstDiskFirstLicense']
+    num_gpu = len(machine_info['accelerator_inventory'])
+    num_cpu = machine_info['cpus']
 
     #
     # Licensing depends on the OS. It can vary by the number of CPUs, the size of RAM, and the number of GPUs.
@@ -739,6 +830,8 @@ def _license_cost(machine_info, license_name, num_cpu, num_gpu, memory_gb, hours
         else:
             raise Exception("No CPU license pricing found")
 
+    vm_dict["skus"]["cpu_os_lic_sku"] = {cpu_price_lineitem[3]: cpu_price_lineitem}
+
     if num_gpu > 0:
         if gpu_key in gpu_lic_pricing_cache:
             gpu_price_lineitem = gpu_lic_pricing_cache[gpu_key]
@@ -748,8 +841,11 @@ def _license_cost(machine_info, license_name, num_cpu, num_gpu, memory_gb, hours
                 gpu_lic_pricing_cache[cpu_key] = gpu_price_lineitem
             else:
                 raise Exception("No GPU license pricing found")
+
+        vm_dict["skus"]["gpu_os_lic_sku"] = {gpu_price_lineitem[3]: gpu_price_lineitem}
+
     else:
-        gpu_price_lineitem = None
+        vm_dict["skus"]["gpu_os_lic_sku"] = None
 
     if ram_key in ram_lic_pricing_cache:
         ram_price_lineitem = ram_lic_pricing_cache[gpu_key]
@@ -760,53 +856,263 @@ def _license_cost(machine_info, license_name, num_cpu, num_gpu, memory_gb, hours
         else:
             raise Exception("No RAM license pricing found")
 
+    vm_dict["skus"]["ram_os_lic_sku"] = {ram_price_lineitem[3]: ram_price_lineitem}
+
+    return
+
+'''
+----------------------------------------------------------------------------------------------
+Get disk sku info:
+'''
+
+def _gather_disk_sku(disk, disk_pricing_cache, pd_dict):
+
+    disk_type = disk['type']
+    disk_zone = disk['zone']
+    is_regional = disk['is_regional']
+    region = '-'.join(disk_zone.split('-')[0:-1]) if not is_regional else disk['disk_region']
+
+    pd_key = (disk_type, region, is_regional)
+    if pd_key in disk_pricing_cache:
+        pd_price_lineitem = disk_pricing_cache[pd_key]
+    else:
+        pd_price_lineitem = _pull_pd_pricing(disk_type, str(is_regional), region, PD_PRICES, PD_KEY_MAP)
+        if pd_price_lineitem is not None:
+            disk_pricing_cache[pd_key] = pd_price_lineitem
+        else:
+            raise Exception("No PD sku found")
+
+    pd_dict["pd_sku"] = {pd_price_lineitem[5]: pd_price_lineitem}
+    return
+
+'''
+----------------------------------------------------------------------------------------------
+Compute the cost of the given machine over the given number of hours:
+'''
+
+def _core_and_ram_and_gpu_cost(hours, vm_dict, cost_per_sku):
+
+    cpu_price_lineitem = None
+    for k, v in vm_dict["skus"]["vm_sku"].items():
+        if cpu_price_lineitem is None:
+            cpu_price_lineitem = v
+        else:
+            print("Multiple CPU SKUs")
+            break
+
+    ram_price_lineitem = None
+    for k, v in vm_dict["skus"]["ram_sku"].items():
+        if ram_price_lineitem is None:
+            ram_price_lineitem = v
+        else:
+            print("Multiple RAM SKUs")
+            break
+
+
+    machine_cost = 0.0
+    core_per_hour = 0.0
+    gb_per_hour = 0.0
+    no_calc = False
+    if cpu_price_lineitem[4] == "HOUR":
+        core_per_hour = cpu_price_lineitem[3]
+    else:
+        no_calc = True
+
+    if ram_price_lineitem[6] is None:
+        gb_per_hour = 0.0
+    elif ram_price_lineitem[6] == "GIBIBYTE_HOUR":
+        gb_per_hour = ram_price_lineitem[5]
+    else:
+        no_calc = True
+    if not no_calc:
+        # Machine type includes the CPU count. Do not multiply by CPU count!
+        this_sku = hours * core_per_hour
+        if cpu_price_lineitem[7] in cost_per_sku:
+            this_sku += cost_per_sku[cpu_price_lineitem[7]]
+        cost_per_sku[cpu_price_lineitem[7]] = this_sku
+
+        this_sku = hours * vm_dict['memory_gb'] * gb_per_hour
+        if cpu_price_lineitem[8] in cost_per_sku:
+            this_sku += cost_per_sku[cpu_price_lineitem[8]]
+        cost_per_sku[cpu_price_lineitem[8]] = this_sku
+
+        machine_cost = (hours * core_per_hour) + (hours * vm_dict['memory_gb'] * gb_per_hour)
+    else:
+        raise Exception("unexpected pricing units: {} {}".format(cpu_price_lineitem[4], ram_price_lineitem[6]))
+
+    #
+    # Now do the GPUs:
+    #
+
+    all_accel = vm_dict["skus"]["gpu_sku"]
+    accel_cost = 0.0
+    for accel_entry in vm_dict["accel"]:
+        gpu_key = (accel_entry['type'], vm_dict['region'], vm_dict["preempt"])
+        gpu_price_lineitem = all_accel[gpu_key]
+        if gpu_price_lineitem is not None:
+            if gpu_price_lineitem[4] == "HOUR":
+                accel_per_hour = gpu_price_lineitem[3]
+                this_sku = hours * accel_per_hour * accel_entry['count']
+                if gpu_price_lineitem[5] in cost_per_sku:
+                    this_sku += cost_per_sku[gpu_price_lineitem[5]]
+                cost_per_sku[gpu_price_lineitem[5]] = this_sku
+                accel_cost += this_sku
+            else:
+                raise Exception("unexpected pricing units: {}".format(gpu_price_lineitem[4]))
+        else:
+            raise Exception("gpu key not present: {}".format(gpu_key))
+
+    return machine_cost + accel_cost
+
+'''
+----------------------------------------------------------------------------------------------
+Compute uptime of the given machine:
+'''
+
+def _machine_uptime(machine_info):
+
+    #
+    # For each machine, calculate the time it has been up since started.
+    #
+    start_time = machine_info['started']
+    if ":" == start_time[-3:-2]:
+        start_time = start_time[:-3] + start_time[-2:]
+    start_time_obj = datetime.datetime.strptime(start_time, '%Y-%m-%dT%H:%M:%S.%f%z')
+
+
+    last_stop = machine_info['lastStop']
+    if last_stop is not None:
+        if ":" == last_stop[-3:-2]:
+            last_stop = last_stop[:-3] + last_stop[-2:]
+        last_stop_obj = datetime.datetime.strptime(last_stop, '%Y-%m-%dT%H:%M:%S.%f%z')
+
+    now_time = datetime.datetime.now(datetime.timezone.utc)
+    uptime = now_time - start_time_obj
+
+    uptime_hours = uptime.total_seconds() / (60 * 60)
+    return uptime_hours
+
+'''
+----------------------------------------------------------------------------------------------
+Compute the license cost of the given machine:
+'''
+
+def _calc_licensing_cost(hours, vm_dict, cost_per_sku):
+
+    cpu_lic_price_lineitem = None
+    for k, v in vm_dict["skus"]["cpu_os_lic_sku"].items():
+        if cpu_lic_price_lineitem is None:
+            cpu_lic_price_lineitem = v
+        else:
+            print("Multiple CPU licensing SKUs")
+            break
+
+    gpu_lic_price_lineitem = None
+    if vm_dict["skus"]["gpu_os_lic_sku"] is not None:
+        for k, v in vm_dict["skus"]["gpu_os_lic_sku"].items():
+            if gpu_lic_price_lineitem is None:
+                gpu_lic_price_lineitem = v
+            else:
+                print("Multiple GPU licensing SKUs")
+                break
+
+    ram_lic_price_lineitem = None
+    for k, v in vm_dict["skus"]["ram_os_lic_sku"].items():
+        if ram_lic_price_lineitem is None:
+            ram_lic_price_lineitem = v
+        else:
+            print("Multiple ram licensing SKUs")
+            break
 
     no_calc = False
     cpu_lic_per_hour = 0.0
     gpu_lic_per_hour = 0.0
     ram_lic_per_hour_per_gib = 0.0
 
-    if cpu_price_lineitem[2] == "HOUR":
-        cpu_lic_per_hour = cpu_price_lineitem[1]
+    if cpu_lic_price_lineitem[2] == "HOUR":
+        cpu_lic_per_hour = cpu_lic_price_lineitem[1]
     else:
         no_calc = True
 
-    if gpu_price_lineitem is not None:
-        if gpu_price_lineitem[2] == "HOUR":
-            gpu_lic_per_hour = gpu_price_lineitem[1]
+    if gpu_lic_price_lineitem is not None:
+        if gpu_lic_price_lineitem[2] == "HOUR":
+            gpu_lic_per_hour = gpu_lic_price_lineitem[1]
         else:
             no_calc = True
-        gpu_units = gpu_price_lineitem[2]
+        gpu_units = gpu_lic_price_lineitem[2]
     else:
         gpu_lic_per_hour = 0.0
         gpu_units = "NO UNITS"
 
-    if ram_price_lineitem[2] == "GIBIBYTE_HOUR":
-        ram_lic_per_hour_per_gib = ram_price_lineitem[1]
+    if ram_lic_price_lineitem[2] == "GIBIBYTE_HOUR":
+        ram_lic_per_hour_per_gib = ram_lic_price_lineitem[1]
     else:
         no_calc = True
 
     if not no_calc:
-        license_cost = (hours * cpu_lic_per_hour) + \
-                       (hours * gpu_lic_per_hour) + \
-                       (hours * memory_gb * ram_lic_per_hour_per_gib)
-        if hours == 1:
-            print("Hourly licensing: license = {}; cpu = {} gpu = {} memory = {}".format(cpu_price_lineitem[0],
-                                                                                         cpu_lic_per_hour,
-                                                                                         gpu_lic_per_hour,
-                                                                                         memory_gb * ram_lic_per_hour_per_gib))
+        this_sku = cpu_lic_per_hour * hours
+        if cpu_lic_price_lineitem[3] in cost_per_sku:
+            this_sku += cost_per_sku[cpu_lic_price_lineitem[3]]
+        cost_per_sku[cpu_lic_price_lineitem[3]] = this_sku
 
+        if gpu_lic_price_lineitem is not None:
+            this_sku = gpu_lic_per_hour * hours
+            if gpu_lic_price_lineitem[3] in cost_per_sku:
+                this_sku += cost_per_sku[gpu_lic_price_lineitem[3]]
+            cost_per_sku[gpu_lic_price_lineitem[3]] = this_sku
+
+        this_sku = ram_lic_per_hour_per_gib * hours * vm_dict["memory_gb"]
+        if ram_lic_price_lineitem[3] in cost_per_sku:
+            this_sku += cost_per_sku[ram_lic_price_lineitem[3]]
+        cost_per_sku[ram_lic_price_lineitem[3]] = this_sku
+
+        license_cost = (cpu_lic_per_hour * hours) + (gpu_lic_per_hour * hours) + (vm_dict["memory_gb"] * ram_lic_per_hour_per_gib * hours)
     else:
-        raise Exception("Unexpected pricing units {} {} {}".format(cpu_price_lineitem[2],
+        raise Exception("Unexpected pricing units {} {} {}".format(cpu_lic_price_lineitem[2],
                                                                    gpu_units,
-                                                                   ram_price_lineitem[2]))
+                                                                   ram_lic_price_lineitem[2]))
     return license_cost
+
 
 '''
 ----------------------------------------------------------------------------------------------
 Compute the cost of the given disk:
 '''
-def _disk_cost(disk, disk_pricing_cache):
+def _calc_disk_cost(hours, pd_dict, cost_per_sku):
+
+    pd_price_lineitem = None
+    for k, v in pd_dict["pd_sku"].items():
+        if pd_price_lineitem is None:
+            pd_price_lineitem = v
+        else:
+            print("Multiple PD SKUs")
+            break
+
+    no_calc = False
+    pd_per_month = 0.0
+
+    if pd_price_lineitem[4] == "GIBIBYTE_MONTH":
+        pd_per_month = pd_price_lineitem[3]
+    else:
+        no_calc = True
+
+    if not no_calc:
+        this_sku = pd_per_month * (hours / 730.0) * pd_dict["gb_size"]
+        if pd_price_lineitem[5] in cost_per_sku:
+            this_sku += cost_per_sku[pd_price_lineitem[5]]
+        cost_per_sku[pd_price_lineitem[5]] = this_sku
+
+    else:
+        raise Exception("unexpected pricing units {}".format(pd_price_lineitem[4]))
+
+    return pd_per_month * (hours / 730) * pd_dict["gb_size"]
+
+
+'''
+----------------------------------------------------------------------------------------------
+Compute the cost of the given disk:
+'''
+def _disk_cost(disk, disk_pricing_cache, pd_dict):
     #
     # For each disk, calculate the time it has been up since started.
     #
@@ -847,6 +1153,8 @@ def _disk_cost(disk, disk_pricing_cache):
         else:
             raise Exception("pd key not present {}".format(pd_key))
 
+        pd_dict["pd_sku"] = {pd_price_lineitem[5]: pd_price_lineitem}
+
         cost_breakdown[interval] = disk_cost
 
     return cost_breakdown
@@ -875,7 +1183,8 @@ def _check_persistent_disk_inventory_aggregate(service, project_id):
                     is_regional = True
                     disk_region = disk['region'].split('/')[-1]
                     print("regional disk %s appears in zone %s" % (disk['region'], zone))
-                disk_list.append({'zone': zone.split('/')[-1],
+                disk_list.append({'id': disk['id'],
+                                  'zone': zone.split('/')[-1],
                                   'name': disk['name'],
                                   'created': datetime.datetime.strptime(disk['creationTimestamp'], '%Y-%m-%dT%H:%M:%S.%f%z'),
                                   'size': int(disk['sizeGb']),
@@ -899,9 +1208,12 @@ def _pull_vm_pricing(machine_key, preemptible, region, cpu_table_name, ram_table
         for row in results:
             if vm_costs is None:
                 vm_costs = (row.machine_key, row.preemptible, row.region,
-                            row.cpu_max_usd, row.cpu_pricing_unit, row.ram_max_usd, row.ram_pricing_unit)
+                            row.cpu_max_usd, row.cpu_pricing_unit, row.ram_max_usd, row.ram_pricing_unit,
+                            row.cpu_sku_id, row.ram_sku_id)
             else:
-                raise Exception("Too many vm cost results")
+                print(row)
+                print("Too many vm cost results")
+                #raise Exception("Too many vm cost results")
     return vm_costs
 
 '''
@@ -917,6 +1229,7 @@ def _machine_cost_sql(machine_key, preemptible, region, cpu_table_name, ram_tabl
           mk2c.ram as ram,
           cpup.preemptible,
           cpup.region,
+          cpup.sku_id,
           cpup.max_usd,
           cpup.min_usd,
           cpup.pricing_unit
@@ -931,9 +1244,11 @@ def _machine_cost_sql(machine_key, preemptible, region, cpu_table_name, ram_tabl
                a1.ram,
                a1.preemptible,
                a1.region,
+               a1.sku_id as cpu_sku_id,
                a1.max_usd as cpu_max_usd,
                a1.min_usd as cpu_min_usd,
                a1.pricing_unit as cpu_pricing_unit,
+               ramp.sku_id as ram_sku_id,
                ramp.max_usd as ram_max_usd,
                ramp.min_usd as ram_min_usd,
                ramp.pricing_unit as ram_pricing_unit
@@ -958,9 +1273,11 @@ def _pull_gpu_pricing(gpu_key, preemptible, region, gpu_table_name, key_mapping)
     if results is not None:
         for row in results:
             if gpu_pricing is None:
-                gpu_pricing = (row.gpu_key, row.preemptible, row.region, row.max_usd, row.pricing_unit)
+                gpu_pricing = (row.gpu_key, row.preemptible, row.region, row.max_usd, row.pricing_unit, row.sku_id)
             else:
-                raise Exception("Too many gpu cost results")
+                print(row)
+                print("Too many gpu cost results")
+                #raise Exception("Too many gpu cost results")
     return gpu_pricing
 
 '''
@@ -976,6 +1293,7 @@ def _gpu_cost_sql(gpu_key, preemptible, region, gpu_table_name, key_mapping):
             gk2g.gpu as gpu,
             gpup.preemptible,
             gpup.region,
+            gpup.sku_id,
             gpup.max_usd,
             gpup.min_usd,
             gpup.pricing_unit
@@ -999,9 +1317,11 @@ def _pull_pd_pricing(pd_key, is_regional, region, pd_table_name, pd_key_mapping)
     if results is not None:
         for row in results:
             if pd_pricing is None:
-                pd_pricing = (row.pd_key, row.is_regional, row.region, row.max_usd, row.pricing_unit)
+                pd_pricing = (row.pd_key, row.is_regional, row.region, row.max_usd, row.pricing_unit, row.sku_id)
             else:
-                raise Exception("Too many pd cost results")
+                print(row)
+                print("Too many pd cost results")
+                #raise Exception("Too many pd cost results")
     return pd_pricing
 
 '''
@@ -1017,6 +1337,7 @@ def _pd_cost_sql(pd_key, is_regional, region, pd_table_name, key_mapping):
             pk2p.pd as pd,
             pdp.is_regional,
             pdp.region,
+            pdp.sku_id,
             pdp.max_usd,
             pdp.min_usd,
             pdp.pricing_unit
@@ -1041,9 +1362,11 @@ def _pull_cpu_lic_pricing(os_key, special_class, cpu_count, cpu_lic_table_name, 
     if results is not None:
         for row in results:
             if cpul_pricing is None:
-                cpul_pricing = (row.lic_key, row.max_usd, row.pricing_unit)
+                cpul_pricing = (row.lic_key, row.max_usd, row.pricing_unit, row.sku_id)
             else:
-                raise Exception("Too many cpu license cost results")
+                print(row)
+                print("Too many cpu lic cost results")
+                #raise Exception("Too many cpu license cost results")
     return cpul_pricing
 
 '''
@@ -1060,6 +1383,7 @@ def _cpu_lic_cost_sql(os_key, special_class, cpu_count, cpu_lic_table_name, lic_
             licp.lic_key,
             lk2l.vm_lic_key,
             lk2l.vm_license,
+            licp.sku_id,
             licp.min_cpu,
             licp.max_cpu,
             licp.min_usd,
@@ -1086,9 +1410,11 @@ def _pull_gpu_lic_pricing(os_key, gpu_count, gpu_lic_table_name, lic_key_mapping
     if results is not None:
         for row in results:
             if gpul_pricing is None:
-                gpul_pricing = (row.lic_key, row.max_usd, row.pricing_unit)
+                gpul_pricing = (row.lic_key, row.max_usd, row.pricing_unit, row.sku_id)
             else:
-                raise Exception("Too many gpu license cost results")
+                print(row)
+                print("Too many gpu lic cost results")
+                #raise Exception("Too many gpu license cost results")
     return gpul_pricing
 
 '''
@@ -1104,16 +1430,17 @@ def _gpu_lic_cost_sql(os_key, gpu_count, gpu_lic_table_name, lic_key_mapping):
             licp.lic_key,
             lk2l.vm_lic_key,
             lk2l.vm_license,
-            licp.min_cpu,
-            licp.max_cpu,
+            licp.sku_id,
+            licp.min_gpu,
+            licp.max_gpu,
             licp.min_usd,
             licp.max_usd,
             licp.pricing_unit
         FROM `{3}` as lk2l
         JOIN `{2}` as licp
         ON lk2l.vm_license = licp.lic_key
-        WHERE (licp.max_cpu is NULL OR licp.max_cpu >= {1})
-        AND (licp.min_cpu is NULL OR licp.min_cpu <= {1})
+        WHERE (licp.max_gpu is NULL OR licp.max_gpu >= {1})
+        AND (licp.min_gpu is NULL OR licp.min_gpu <= {1})
         AND lk2l.vm_lic_key = "{0}"
         '''.format(os_key, gpu_count, gpu_lic_table_name, lic_key_mapping)
     return sql
@@ -1129,9 +1456,11 @@ def _pull_ram_lic_pricing(os_key, ram_lic_table_name, lic_key_mapping):
     if results is not None:
         for row in results:
             if raml_pricing is None:
-                raml_pricing = (row.lic_key, row.max_usd, row.pricing_unit)
+                raml_pricing = (row.lic_key, row.max_usd, row.pricing_unit, row.sku_id)
             else:
-                raise Exception("Too many ram license cost results")
+                print(row)
+                print("Too many ram lic cost results")
+                #raise Exception("Too many ram license cost results")
     return raml_pricing
 
 '''
@@ -1146,6 +1475,7 @@ def _ram_lic_cost_sql(os_key, ram_lic_table_name, lic_key_mapping):
             licp.lic_key,
             lk2l.vm_lic_key,
             lk2l.vm_license,
+            licp.sku_id,
             licp.min_usd,
             licp.max_usd,
             licp.pricing_unit
@@ -1241,6 +1571,134 @@ def _egress_sql(table_name, project_id):
 
 '''
 ----------------------------------------------------------------------------------------------
+Find out when Google last reported charges for each significant SKU
+'''
+def _estimate_burn_for_sku(sku_history):
+
+    #
+    # What is the last complete usage slot? If we have at least three slots, and the last is *less* than
+    # the previous two (or better, three), we consider that last slot to be incomplete. We return the
+    # cost of that second to last slot, and the number of hours it needs to be applied to get up to the present
+    # moment.
+    #
+
+    cost_history = []
+    for slot in sku_history:
+        cost_history.append(slot['total_cost'])
+
+    if len(cost_history) == 1:
+        # One point is all we have.
+        return cost_history[0], sku_history[0]['usage_end_time']
+    elif len(cost_history) == 2:
+        # If we have the two points and the last is lower, we consider it incomplete.
+        # If the last point is higher, we were ramping up.
+        # Basically, return the maxiumum
+        return cost_history[0], sku_history[0]['usage_end_time']
+    elif len(cost_history) == 3:
+        pass
+    elif len(cost_history) == 4:
+        pass
+
+    return
+    '''
+
+    charge_history_for_sku = {}
+    if results is not None:
+        for row in results:
+            if row.sku not in charge_history_for_sku:
+                history = []
+                charge_history_for_sku[row.sku] = history
+            else:
+                history = charge_history_for_sku[row.sku]
+
+            history.append({'description': row.description,
+                            'sku_description': row.sku_description,
+                            'usage_start_time': row.usage_start_time,
+                            'usage_end_time': row.usage_end_time,
+                            'first_export': row.first_export,
+                            'last_export': row.last_export,
+                            'total_cost': row.total_cost,
+                            'delay': row.delay})
+
+    return charge_history_for_sku
+
+    '''
+
+
+
+'''
+----------------------------------------------------------------------------------------------
+Find out when Google last reported charges for each significant SKU
+'''
+def _get_charge_history_for_sku(table_name, project_id, min_charge, depth):
+    sql = _last_n_charges_sql(table_name, project_id, min_charge, depth)
+    results = _bq_harness_with_result(sql, False)
+
+    charge_history_for_sku = {}
+    if results is not None:
+        for row in results:
+            if row.sku_id not in charge_history_for_sku:
+                history = []
+                charge_history_for_sku[row.sku_id] = history
+            else:
+                history = charge_history_for_sku[row.sku_id]
+
+            history.append({'description': row.description,
+                            'sku_description': row.sku_description,
+                            'usage_start_time': row.usage_start_time,
+                            'usage_end_time': row.usage_end_time,
+                            'first_export': row.first_export,
+                            'last_export': row.last_export,
+                            'total_cost': row.total_cost,
+                            'delay': row.delay})
+
+    return charge_history_for_sku
+
+
+'''
+----------------------------------------------------------------------------------------------
+SQL for above
+'''
+
+def _last_n_charges_sql(table_name, project_id, tiny_min_charge, depth):
+
+    #
+    # For charges that are not tiny, over the last two days, sum them all up in each usage time interval.
+    # Return the last "depth" intervals. Also report the oldest and newest export times for that interval,
+    # and calculate how stale the last reported interval is.
+    #
+    # What is currently seen is that with constant charges (e.g. a running VM), the last export will be
+    # several hours (e.g. five or six) ago, and that last export is often a partial accounting. You need to
+    # go to the second oldest value to get a number matching the long-term trend.
+    #
+
+    sql = '''
+        WITH a1 as (
+          SELECT
+            service.description AS description,
+            sku.id AS sku_id,
+            sku.description AS sku_description,
+            usage_start_time,
+            usage_end_time,
+            MIN(export_time) AS first_export,
+            MAX(export_time) AS last_export,
+            ROUND(SUM(cost), 5) as total_cost,
+            RANK() OVER (PARTITION BY sku.id ORDER BY usage_end_time desc) AS rank,
+            CURRENT_TIMESTAMP() - usage_end_time as delay
+          FROM `{0}`
+            WHERE
+            _PARTITIONTIME > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 DAY)
+            AND cost > {2}
+            AND project.id = "{1}"
+          GROUP BY service.description, sku.id, sku.description, usage_start_time, usage_end_time
+        )
+        SELECT * from a1 where rank <= {3} ORDER BY sku_id, usage_start_time desc
+        '''.format(table_name, project_id, tiny_min_charge, depth)
+
+    return sql
+
+'''
+----------------------------------------------------------------------------------------------
 Use to run queries where we want to get the result back to use (not write into a table)
 '''
 def _bq_harness_with_result(sql, do_batch):
@@ -1277,3 +1735,5 @@ def _bq_harness_with_result(sql, do_batch):
     return results
 
 
+if __name__ == "__main__":
+    web_trigger(None)
