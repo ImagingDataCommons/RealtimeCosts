@@ -582,7 +582,7 @@ def _pull_vm_pricing(machine_key, preemptible, region, cpu_table_name, ram_table
         for row in results:
             if vm_costs is None:
                 vm_costs = (row.machine_key, row.preemptible, row.region,
-                            row.cpu_max_usd, row.cpu_pricing_unit, row.ram_max_usd, row.ram_pricing_unit)
+                            row.cpu_max_usd, row.cpu_pricing_unit, row.ram_max_usd, row.ram_pricing_unit, row.sku_id)
             else:
                 raise Exception("Too many vm cost results")
     return vm_costs
@@ -600,6 +600,7 @@ def _machine_cost_sql(machine_key, preemptible, region, cpu_table_name, ram_tabl
           mk2c.ram as ram,
           cpup.preemptible,
           cpup.region,
+          cpup.sku_id,
           cpup.max_usd,
           cpup.min_usd,
           cpup.pricing_unit
@@ -614,6 +615,7 @@ def _machine_cost_sql(machine_key, preemptible, region, cpu_table_name, ram_tabl
                a1.ram,
                a1.preemptible,
                a1.region,
+               a1.sku_id,
                a1.max_usd as cpu_max_usd,
                a1.min_usd as cpu_min_usd,
                a1.pricing_unit as cpu_pricing_unit,

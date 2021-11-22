@@ -64,6 +64,7 @@ def generate_cpu_table_sql(sku_table):
             TRIM(REPLACE(REPLACE(REGEXP_EXTRACT(sku.description, "(.*) in .*"), "Preemptible ", " "), "running", "")) as cpu,
             (STRPOS(sku.description, "reemptible") != 0) as preemptible,
             region,
+            sku.id as sku_id,
             tr.usd_amount as usd_amount,
             pricing_unit
         FROM `{0}`, UNNEST(geo_taxonomy.regions) as region,
@@ -76,9 +77,9 @@ def generate_cpu_table_sql(sku_table):
         AND NOT sku.description LIKE "%Commitment%"
         AND NOT sku.description LIKE "%Ram%"
         AND service.description LIKE "%Compute%")
-        SELECT cpu, preemptible, region, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit
+        SELECT cpu, preemptible, region, sku_id, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit
         FROM a1
-        GROUP BY cpu, preemptible, region, pricing_unit
+        GROUP BY cpu, preemptible, region, sku_id, pricing_unit
         '''.format(sku_table)
 
 '''
@@ -100,6 +101,7 @@ def generate_ram_table_sql(sku_table):
             TRIM(REPLACE(REPLACE(REGEXP_EXTRACT(sku.description, "(.*) in .*"), "Preemptible ", " "), "running", "")) as cpu,
             (STRPOS(sku.description, "reemptible") != 0) as preemptible,
             region,
+            sku.id as sku_id,
             tr.usd_amount as usd_amount,
             pricing_unit
         FROM `{0}`, UNNEST(geo_taxonomy.regions) as region,
@@ -112,8 +114,8 @@ def generate_ram_table_sql(sku_table):
         AND NOT sku.description LIKE "%Commitment%"
         AND (sku.description LIKE "%Ram%" OR sku.description LIKE "%RAM%")
         AND service.description LIKE "%Compute%")
-        SELECT cpu, preemptible, region, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit FROM a1
-        GROUP BY cpu, preemptible, region, pricing_unit
+        SELECT cpu, preemptible, region, sku_id, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit FROM a1
+        GROUP BY cpu, preemptible, region, sku_id, pricing_unit
         '''.format(sku_table)
 
 '''
@@ -135,6 +137,7 @@ def generate_gpu_table_sql(sku_table):
                CONCAT("Nvidia ", REGEXP_EXTRACT(sku.description, ".*Nvidia (.*) GPU .*")) as gpu,
                (STRPOS(sku.description, "reemptible") != 0) as preemptible,
                region,
+               sku.id as sku_id,
                tr.usd_amount as usd_amount,
                pricing_unit
         FROM `{0}`, UNNEST(geo_taxonomy.regions) as region, UNNEST(billing_account_price.tiered_rates) as tr
@@ -146,8 +149,8 @@ def generate_gpu_table_sql(sku_table):
         AND NOT sku.description LIKE "%Commitment%"
         AND NOT sku.description LIKE "%Ram%"
         AND service.description LIKE "%Compute%")
-        SELECT gpu, preemptible, region, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit FROM a1
-        GROUP BY gpu, preemptible, region, pricing_unit
+        SELECT gpu, preemptible, region, sku_id, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit FROM a1
+        GROUP BY gpu, preemptible, region, sku_id, pricing_unit
         '''.format(sku_table)
 
 
@@ -170,12 +173,13 @@ def generate_pd_table_sql(sku_table):
                TRIM(REPLACE(CONCAT(REGEXP_EXTRACT(sku.description, "(.*) PD Capacity.*"), " PD Capacity"), "Regional ", "")) as pd,
                (STRPOS(sku.description, "Regional") != 0) as is_regional,
                region,
+               sku.id as sku_id,
                tr.usd_amount as usd_amount,
                pricing_unit
         FROM `{0}`, UNNEST(geo_taxonomy.regions) as region, UNNEST(billing_account_price.tiered_rates) as tr
         WHERE sku.description LIKE "%PD Capacity%")
-        SELECT pd, is_regional, region, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit FROM a1
-        GROUP BY pd, is_regional, region, pricing_unit
+        SELECT pd, is_regional, region, sku_id, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit FROM a1
+        GROUP BY pd, is_regional, region, sku_id, pricing_unit
         '''.format(sku_table)
 
 '''
@@ -196,14 +200,15 @@ def generate_ip_table_sql(sku_table):
         WITH a1 AS (SELECT DISTINCT
             TRIM(REGEXP_EXTRACT(sku.description, "(.*) on a .*")) AS ip_key,
                (STRPOS(sku.description, "reemptible") != 0) as preemptible,
+               sku.id as sku_id,
                tr.usd_amount as usd_amount,
                pricing_unit
         FROM `{0}`,
         UNNEST(billing_account_price.tiered_rates) as tr
         WHERE (sku.description LIKE "% IP %")
         AND service.description LIKE "%Compute%")
-        SELECT ip_key, preemptible, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit FROM a1
-        GROUP BY ip_key, preemptible, pricing_unit
+        SELECT ip_key, preemptible, sku_id, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit FROM a1
+        GROUP BY ip_key, preemptible, sku_id, pricing_unit
         '''.format(sku_table)
 
 '''
@@ -241,14 +246,15 @@ def generate_gpu_lic_table_sql(sku_table):
                      ELSE
                            NULL
                 END as min_gpu,
-               tr.usd_amount as usd_amount,
-               pricing_unit
+                sku.id as sku_id,
+                tr.usd_amount as usd_amount,
+                pricing_unit
         FROM `{0}`,
         UNNEST(billing_account_price.tiered_rates) as tr
         WHERE (sku.description LIKE "%Licen%" AND sku.description LIKE "%GPU%")
         AND service.description LIKE "%Compute%")
-        SELECT lic_key, min_gpu, max_gpu, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit FROM a1
-        GROUP BY lic_key, min_gpu, max_gpu, pricing_unit
+        SELECT lic_key, min_gpu, max_gpu, sku_id, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit FROM a1
+        GROUP BY lic_key, min_gpu, max_gpu, sku_id, pricing_unit
         '''.format(sku_table)
 
 '''
@@ -270,16 +276,16 @@ def generate_cpu_lic_table_sql(sku_table):
                CASE WHEN (STRPOS(sku.description, " on g1-small") != 0) THEN "g1-small"
                     WHEN (STRPOS(sku.description, " on f1-micro") != 0) THEN "f1-micro"
                     ELSE NULL
-                END as machine_class,
-                CASE WHEN (STRPOS(sku.description, " on VM with ") != 0) THEN
+               END as machine_class,
+               CASE WHEN (STRPOS(sku.description, " on VM with ") != 0) THEN
                         TRIM(REGEXP_EXTRACT(sku.description, "Licensing Fee for (.*) on VM with .*"))
                      WHEN (STRPOS(sku.description, " on g1-small") != 0) OR
                           (STRPOS(sku.description, " on f1-micro") != 0)THEN
                         TRIM(REGEXP_EXTRACT(sku.description, "Licensing Fee for (.*) on .*"))
                      ELSE
                         TRIM(REPLACE(REGEXP_EXTRACT(sku.description, "Licensing Fee for (.*)"), "(CPU cost)", ""))
-                END as lic_key,
-                CASE WHEN (sku.description LIKE '% on VM with up to %') THEN
+               END as lic_key,
+               CASE WHEN (sku.description LIKE '% on VM with up to %') THEN
                            CAST(REGEXP_EXTRACT(sku.description, '.* on VM with up to ([0-9]+) VCPU') AS INT64)
                      WHEN (sku.description LIKE '% on VM with % to %') THEN
                            CAST(REGEXP_EXTRACT(sku.description, '.* on VM with [0-9]+ to ([0-9]+) VCPU') AS INT64)
@@ -287,8 +293,8 @@ def generate_cpu_lic_table_sql(sku_table):
                            CAST(REGEXP_EXTRACT(sku.description, '.* on VM with ([0-9]+) VCPU') AS INT64)
                      ELSE
                            NULL
-                END as max_cpu,
-                CASE WHEN (sku.description LIKE '% or more %') THEN
+               END as max_cpu,
+               CASE WHEN (sku.description LIKE '% or more %') THEN
                            CAST(REGEXP_EXTRACT(sku.description, '.* on VM with ([0-9]+) or more VCPU') AS INT64)
                      WHEN (sku.description LIKE '% on VM with % to %') THEN
                            CAST(REGEXP_EXTRACT(sku.description, '.* on VM with ([0-9]+) to [0-9]+ VCPU') AS INT64)
@@ -296,15 +302,16 @@ def generate_cpu_lic_table_sql(sku_table):
                            CAST(REGEXP_EXTRACT(sku.description, '.* on VM with ([0-9]+) VCPU') AS INT64)
                      ELSE
                            NULL
-                END as min_cpu,
+               END as min_cpu,
+               sku.id as sku_id,
                tr.usd_amount as usd_amount,
                pricing_unit
         FROM `{0}`,
         UNNEST(billing_account_price.tiered_rates) as tr
         WHERE (sku.description LIKE "%Licen%" AND NOT sku.description LIKE "%GPU%" AND NOT sku.description LIKE "%RAM cost%")
         AND service.description LIKE "%Compute%")
-        SELECT machine_class, lic_key, min_cpu, max_cpu, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit FROM a1
-        GROUP BY machine_class, lic_key, min_cpu, max_cpu, pricing_unit
+        SELECT machine_class, lic_key, min_cpu, max_cpu, sku_id, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit FROM a1
+        GROUP BY machine_class, lic_key, min_cpu, max_cpu, sku_id, pricing_unit
         '''.format(sku_table)
 
 '''
@@ -324,14 +331,15 @@ def generate_ram_lic_table_sql(sku_table):
     return '''
         WITH a1 AS (SELECT DISTINCT
             TRIM(REPLACE(REGEXP_EXTRACT(sku.description, "Licensing Fee for (.*)"), "(RAM cost)", "")) AS lic_key,
+            sku.id as sku_id,
             tr.usd_amount as usd_amount,
             pricing_unit
         FROM `{0}`,
         UNNEST(billing_account_price.tiered_rates) as tr
         WHERE (sku.description LIKE "%Licen%" AND sku.description LIKE "%RAM%")
         AND service.description LIKE "%Compute%")
-        SELECT lic_key, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit FROM a1
-        GROUP BY lic_key, pricing_unit
+        SELECT lic_key, sku_id, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit FROM a1
+        GROUP BY lic_key, sku_id, pricing_unit
         '''.format(sku_table)
 
 '''

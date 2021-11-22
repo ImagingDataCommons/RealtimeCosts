@@ -1,6 +1,6 @@
 [
   {
-    "name": "machine_key",
+    "name": "machine_key",   nfnajfna
     "type": "STRING",
     "mode": "REQUIRED",
     "description": ""
@@ -8,6 +8,12 @@
   {
     "name": "cpu",
     "type": "STRING",
+    "mode": "REQUIRED",
+    "description": ""
+  },
+  {
+    "name": "cpus_per_core",
+    "type": "INT64",
     "mode": "REQUIRED",
     "description": ""
   },

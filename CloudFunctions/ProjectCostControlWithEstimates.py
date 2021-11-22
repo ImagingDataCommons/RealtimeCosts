@@ -97,16 +97,23 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
     except:
         raise Exception("State bucket does not exist") # Better yet, create it and keep going
 
-    burn_blob = "{}_burn_state.json".format(project_id)
+    burn_blob = "{}_born_state.json".format(project_id) ## FIXME FOR DEPLOY
     blob = bucket.blob(burn_blob)
     burn_blob_str = blob.download_as_string() if blob.exists() else b''
     if burn_blob_str == b'':
         burn_state = {"vm_instances" : {},
                       "pdisks": {},
-                      "inventory_time": None
+                      "inventory_time": None,
+                      "elapsed_seconds_since_previous_inventory": None
                      }
     else:
         burn_state = json.loads(burn_blob_str)
+
+    last_inventory_time = burn_state["inventory_time"]
+    if burn_state["inventory_time"] is not None:
+        elapsed = now_time - datetime.datetime.strptime(burn_state["inventory_time"], '%Y-%m-%dT%H:%M:%S.%f%z')
+        burn_state["elapsed_seconds_since_previous_inventory"] = (elapsed.days * 86400.0) + elapsed.seconds
+    burn_state["inventory_time"] = now_time.strftime('%Y-%m-%dT%H:%M:%S.%f%z')
 
     #
     # If we are not just doing a burn estimate, we get here via a pubsub message about every 20 minutes all
@@ -119,6 +126,7 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
     fraction  = 0.0
     total_spend = 0.0
     additional_fees = 0.0
+    per_hour_charge = 0.0
     budget_state = None
     message_state = None
     week_num = None
@@ -183,25 +191,30 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
     #
 
     excess_vm_stop_list = []
-    compute_inventory = {}
+    running_inventory = {}
+    stopped_inventory = {}
+    all_ids = set()
     disk_inventory = {}
     all_vm_dict = {}
     all_pd_dict = {}
     is_enabled = _check_compute_services_for_project(project_id)
     if is_enabled:
         compute = discovery.build('compute', 'v1', cache_discovery=False)
-        compute_inventory, type_dict, total_cpus = _check_compute_engine_inventory_aggregate(compute, project_id)
-        print("what about deleting VMs?")
+        running_inventory, type_dict, total_cpus, stopped_inventory = _check_compute_engine_inventory_aggregate(compute, project_id)
         all_vm_dict = burn_state['vm_instances']
-        for k, v in compute_inventory.items():
-            _build_vm_inventory(v, type_dict, now_hour, now_time, all_vm_dict)
+        for k, v in running_inventory.items():
+            _build_vm_inventory(v, type_dict, now_hour, now_time, last_inventory_time, all_vm_dict)
+            all_ids.add(k[4])
+        for k, v in stopped_inventory.items():
+            _build_vm_inventory(v, type_dict, now_hour, now_time, last_inventory_time, all_vm_dict)
+            all_ids.add(k[4])
 
         print("Project {} cpu count {}".format(project_id, total_cpus))
         if (not only_estimate_burn) and (total_cpus > MAX_CPUS):
             message_key = message_root_fmt.format("3")
             shutdown = total_cpus - MAX_CPUS
             print("{}: Project {} is over CPU limit: {} Shutting down {}".format(message_key, project_id, total_cpus, shutdown))
-            excess_vm_stop_list = _prepare_shutdown_list(compute_inventory, shutdown)
+            excess_vm_stop_list = _prepare_shutdown_list(running_inventory, shutdown)
 
         all_pd_dict = burn_state['pdisks']
         disk_inventory = _check_persistent_disk_inventory_aggregate(compute, project_id)
@@ -226,7 +239,7 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
 
     vm_count = 0
     if is_enabled:
-        for k, v in compute_inventory.items():
+        for k, v in running_inventory.items():
             vm_dict = all_vm_dict[v['id']]
             _gather_vm_skus(v, vm_pricing_cache, gpu_pricing_cache, vm_dict)
             _gather_license_skus(v, cpu_lic_pricing_cache, gpu_lic_pricing_cache, ram_lic_pricing_cache, vm_dict)
@@ -249,11 +262,16 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
         for clock_time in usage_hours:
             cost_per_sku = {}
             for k, vm_dict in all_vm_dict.items():
-                minutes_running = vm_dict["usage"][clock_time]
-                machine_cost = _core_and_ram_and_gpu_cost(minutes_running/60 , vm_dict, cost_per_sku)
-                _calc_licensing_cost(minutes_running/60, vm_dict, cost_per_sku)
+                # Seeing key errors here if the bookkeeping has fallen over for awhile
+                # e.g. KeyError: '2021-11-15T06+0000'"
+                # Which implies the loaded VM dict does not have all the last 13 hours.
+                # So, adding the key test:
+                if vm_dict['status'] == "RUNNING":
+                    minutes_running = vm_dict["usage"][clock_time] if clock_time in vm_dict["usage"] else 0.0
+                    machine_cost = _core_and_ram_and_gpu_cost(minutes_running/60 , vm_dict, cost_per_sku)
+                    _calc_licensing_cost(minutes_running/60, vm_dict, cost_per_sku)
             for k, pd_dict in all_pd_dict.items():
-                minutes_running = pd_dict["usage"][clock_time]
+                minutes_running = pd_dict["usage"][clock_time] if clock_time in pd_dict["usage"] else 0.0
                 dc = _calc_disk_cost(minutes_running/60, pd_dict, cost_per_sku)
             for k, v in cost_per_sku.items():
                 if clock_time in master_chart:
@@ -293,7 +311,8 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
             for sku, record in sku_records.items():
                 if (record["calc"] != 0) or (record["goog"] != 0):
                     diff = record["calc"] - record["goog"]
-                    print("{} {} ({}) calc: {} google: {} (delta: {})".format(clock_time, sku, sku_desc[sku],
+                    sku_text = sku_desc[sku] if sku in sku_desc else "No description collected"
+                    print("{} {} ({}) calc: {} google: {} (delta: {})".format(clock_time, sku, sku_text,
                                                                               record["calc"], record["goog"],
                                                                               str(round(diff, 5))))
                     if diff > 0:
@@ -302,6 +321,26 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
             print("-------------------------------------------------------------------------------------")
 
         print("add {} to the current Google reported spending".format(round(additional_fees, 2)))
+
+        #
+        # Compute hours to exhaustion:
+        #
+
+
+        last_full_hour_key = (now_hour - datetime.timedelta(hours=1)).strftime('%Y-%m-%dT%H%z')
+        sku_records =  master_chart[last_full_hour_key]
+        for sku, record in sku_records.items():
+            per_hour_charge += record["calc"]
+
+    #
+    # Here we take the opportunity to prune out VMs from our persistent store if they no longer
+    # exist (stopped or running)
+    #
+
+    all_vm_dict = _prune_vm_persistent_store(all_vm_dict, now_time.month,
+                                             stopped_inventory, last_inventory_time, all_ids)
+
+    burn_state['vm_instances'] = all_vm_dict
 
     #
     # Save the instance state:
@@ -324,8 +363,25 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
         total_spend += additional_fees
         fraction = float(total_spend) / float(budget_amount)
 
-        message = "Project: {} Budget: ${} Charges: ${:.2f} (including estimated additional charges to come: ${:.2f}) Fraction: {:.4f}".format(project_id, budget_amount, total_spend, additional_fees, fraction)
+        message = "Project: {} Budget: ${} Charges: ${:.2f} (including estimated additional charges to come: ${:.2f}) Fraction: {:.4f}".format(
+            project_id, budget_amount, total_spend, additional_fees, fraction)
         cost_logger.log_text(message)
+
+        #
+        # NOT TRUE. This only includes estimated VM costs. Should also take the last reported values of other big ticket
+        # items as well! Look for SKUs that appear in our Google history and add them in TOO!
+        # Note that storage costs (e.g. SKU 5F7A-5173-CF5B: Standard Storage Northern Virginia) are charged once a
+        # day. They are recorded as usage in a ONE HOUR WINDOW (e.g. Start : 021-11-04 19:00:00 UTC and END: 2021-11-04 20:00:00 UTC)
+        # but the price that appears is for a one day charge. It appears that bits in buckets is only measured once
+        # per day.
+        #
+
+        remaining_funds = budget_amount - total_spend
+        if remaining_funds > 0:
+            hours_to_go = remaining_funds / per_hour_charge
+            message = "Project: {} Has an estimated {:.2f} hours left".format(project_id, hours_to_go)
+            print(message)
+            cost_logger.log_text(message)
 
         need_to_act = (fraction >= 1.0)
 
@@ -342,7 +398,7 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
 
         have_appengine = _check_appengine(project_id)
         if need_to_act:
-            full_stop_list = _prepare_shutdown_list(compute_inventory)
+            full_stop_list = _prepare_shutdown_list(running_inventory)
             if len(full_stop_list) > 0:
                 print("Project {} turning off VMs".format(project_id))
                 _process_shutdown_list(project_id, full_stop_list)
@@ -368,7 +424,35 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
 
     return
 
+'''
+----------------------------------------------------------------------------------------------
+Clean up our VM persistent store
+'''
 
+def _prune_vm_persistent_store(all_vm_dict, this_month, stopped_dict, last_inventory, all_ids):
+    #
+    # On the first invocation of the month, after we have gone through the active inventory of VMs, we
+    # want to toss out VMs that don't exist anymore. Note that keeping a stopped VM record around can
+    # be valuable, since it can give us info on how long a VM has been around for uptime calcualation
+    #
+
+    print(all_ids)
+    new_all_vm_dict = {}
+    for machine_id, vm_dict in all_vm_dict.items():
+        #
+        # Remove machines from our persistent store if they no longer exist
+        #
+        print(machine_id)
+        if machine_id in all_ids:
+             print("adding {}".format(machine_id))
+             print("Clean up:")
+             print("last start", vm_dict['last_start_uptime_record'])
+             print("last stop", vm_dict['last_stop_uptime_record'])
+             for rec in vm_dict['uptime_records']:
+                 print(rec)
+             new_all_vm_dict[machine_id] = vm_dict
+
+    return new_all_vm_dict
 
 '''
 ----------------------------------------------------------------------------------------------
@@ -398,21 +482,83 @@ def _build_pd_inventory(disk, now_hour, now_time, all_pd_dict):
 Build up the VM inventory
 '''
 
-def _build_vm_inventory(machine_info, type_dict, now_hour, now_time, all_vm_dict):
+def _build_vm_inventory(machine_info, type_dict, now_hour, now_time, last_inventory_time, all_vm_dict):
+
+    now_month = datetime.datetime(now_time.year, now_time.month, 1, 0, tzinfo=now_time.tzinfo)
+    #now_month_str = now_month.strftime('%Y-%m-%dT%H:%M:%S.%f%z')
+
     #
     # pull per-instance record out of the persistent state, or create it:
     #
+
     if machine_info['id'] in all_vm_dict:
         vm_dict = all_vm_dict[machine_info['id']]
+        #mi_started_dt = datetime.datetime.strptime(machine_info['started'], '%Y-%m-%dT%H:%M:%S.%f%z')
+        #started_previous_month = now_month > mi_started_dt
+        vm_dict['status'] = machine_info['status']
+
+        # Deal with stopped machines.
+        if vm_dict['status'] != "RUNNING":
+            if vm_dict['last_start_uptime_record'] is not None:
+                # If the start time for this stopped machine is the same as the one on record, then nothing has
+                # happened to the machine since we last saw it, except that it has stopped. We update the
+                # record that had just the start time with the stop time, and add it to our uptime records.
+                # We won't keep doing this, but just do it the first time:
+                if vm_dict['last_start_uptime_record']['start'] == machine_info['started']:
+                    vm_dict['last_start_uptime_record']['stop'] = machine_info['lastStop']
+                    vm_dict['last_stop_uptime_record'] = vm_dict['last_start_uptime_record']
+                    vm_dict['uptime_records'].append(vm_dict['last_stop_uptime_record'])
+                    vm_dict['last_start_uptime_record'] = None
+                else:
+                    # We have a record where we did not get a chance to close out the previous uptime,
+                    # but the start time has changed from what we recorded. The machine was stopped, then
+                    # briefly cycled start/stop at least once, before our next polling. We only know about
+                    # the last. The conservative approach is to record that it shut down at the last
+                    # inventory period, since that will underestimate monthly uptime and thus the discount
+                    vm_dict['last_start_uptime_record']['stop'] = last_inventory_time
+                    vm_dict['last_stop_uptime_record'] = vm_dict['last_start_uptime_record']
+                    vm_dict['uptime_records'].append(vm_dict['last_stop_uptime_record'])
+                    vm_dict['last_start_uptime_record'] = None
+            #
+            # It is possible that the machine has been cycled on/off since our last polling. We want
+            # to capture that in our records.
+            #
+            elif ((vm_dict['last_stop_uptime_record'] is None) or
+                  ((vm_dict['last_stop_uptime_record']['start'] != machine_info['started']) and
+                   (vm_dict['last_stop_uptime_record']['stop'] != machine_info['lastStop']))):
+                new_cycle = {'start': machine_info['started'], 'stop': machine_info['lastStop']}
+                vm_dict['uptime_records'].append(new_cycle)
+                vm_dict['last_stop_uptime_record'] = new_cycle
+
+        else: # machine is running NOW, but we might not have updated the last_start record
+              # yet! Needs to be filled in! May not even have a start record yet:
+            if vm_dict['last_start_uptime_record'] is None:
+                vm_dict['last_start_uptime_record'] = {"start": machine_info['started'], "stop": None}
+            elif vm_dict['last_start_uptime_record']['start'] != machine_info['started']:
+                vm_dict['last_start_uptime_record']['stop'] = machine_info['lastStop']
+                vm_dict['uptime_records'].append(vm_dict['last_start_uptime_record'])
+                vm_dict['last_stop_uptime_record'] = vm_dict['last_start_uptime_record']
+                vm_dict['last_start_uptime_record'] = {"start": machine_info['started'], "stop": None}
+
     else:
         vm_dict = {
             "id": machine_info['id'],
+            'status': machine_info['status'],
             "preempt": machine_info['preemptible'],
             "machine_type": machine_info['machineType'],
             "machine_zone": machine_info['zone'],
             "memory_gb": type_dict[(machine_info['zone'], machine_info['machineType'])]['memory'] / 1024,
             "region": '-'.join(machine_info['zone'].split('-')[0:-1]),
             "accel": machine_info['accelerator_inventory'],
+            'created': machine_info['created'],
+            'started': machine_info['started'],
+            'last_stop': machine_info['lastStop'],
+            'last_stop_uptime_record': None,
+            'last_start_uptime_record': None,
+            'uptime_records': [],
+            'current_discount': None,
+            'cpus': machine_info['cpus'],
+            'cpus_per_core': None,
             "skus": {
                 "vm_sku": None,
                 "ram_sku": None,
@@ -425,15 +571,131 @@ def _build_vm_inventory(machine_info, type_dict, now_hour, now_time, all_vm_dict
             "usage": {}
         }
         all_vm_dict[machine_info['id']] = vm_dict
-    #
-    # For the VM, fill in the runtime for hour slots back to the beginning of our series, or to the last
-    # start time of the VM, whichever is later. Don't touch older slots, if they exist. Make it so we build
-    # the whole series from scratch the first time, and also that we throw out old entries we don't care
-    # about anymore:
-    #
 
-    vm_dict['usage'] = _fill_time_series(now_hour, now_time, machine_info['started'], vm_dict['usage'])
+        #
+        # A new record is created either because the machine is new, or because we just started our
+        # monitoring. If the former, the machine could, or could not, have a stop time. Since we
+        # are now building dicts even for machines that are stopped, there might be a stop even for
+        # new machines.
+        #
+        # If the machine is stopped, then we will have a start time for it that is older than the
+        # stop time, and we can create a complete new record. But if the machine is running, and
+        # we have a last stop time, and we don't know when it started before that. If the last
+        # stop time is before the start of the month, we can ignore it, and consider the start time
+        # to be the first of the month. Otherwise, all we can use in that case is the created time,
+        # or the last stop time (which is the most conservative, since there will be less of a discount).
+        #
+
+        if vm_dict['status'] != "RUNNING":
+            new_record = {'start': vm_dict['started'], 'stop': vm_dict['last_stop']}
+            vm_dict['last_stop_uptime_record'] = new_record
+            vm_dict['uptime_records'].append(new_record)
+        else:
+            if vm_dict['last_stop'] is not None:
+                last_stop_dt = datetime.datetime.strptime(vm_dict['last_stop'], '%Y-%m-%dT%H:%M:%S.%f%z')
+                if last_stop_dt < now_month:
+                    new_record = {'start': now_month.strftime('%Y-%m-%dT%H:%M:%S.%f%z'), 'stop': vm_dict['last_stop']}
+                else:
+                    new_record = {'start': vm_dict['last_stop'], 'stop': vm_dict['last_stop']}
+                vm_dict['uptime_records'].append(new_record)
+                vm_dict['last_stop_uptime_record'] = new_record
+
+            vm_dict['last_start_uptime_record'] = {"start": machine_info['started']}
+
+
+    #
+    # If the machine is stopped, we are done. If it is running, figure out for how long:
+    #
+    if vm_dict['status'] == "RUNNING":
+
+        last_stop_dt = datetime.datetime.strptime(vm_dict['last_stop'],
+                                                  '%Y-%m-%dT%H:%M:%S.%f%z') if vm_dict['last_stop'] is not None else None
+        started_dt = datetime.datetime.strptime(vm_dict['started'], '%Y-%m-%dT%H:%M:%S.%f%z')
+
+        #
+        # Figure out the uptime for the month. If the uptime records list is empty, the machine has never stopped.
+        #
+
+        uptime_this_month = datetime.timedelta(minutes=0)
+        if last_stop_dt is None: # machine has never stopped:
+            uptime_this_month = now_time - (now_month if (started_dt < now_month) else started_dt)
+        else:
+            # go though all the uptime records and sum them up, then take the last 'last_start_uptime_record'
+            # and calculate the uptime in this month by summing the uptimes
+            for uptime_record in vm_dict['uptime_records']:
+                uptime_stop_dt = datetime.datetime.strptime(uptime_record['stop'], '%Y-%m-%dT%H:%M:%S.%f%z')
+                uptime_start_dt = datetime.datetime.strptime(uptime_record['start'], '%Y-%m-%dT%H:%M:%S.%f%z')
+                if uptime_stop_dt < now_month:  # Ignore. This is a previous month
+                    continue
+                use_start = now_month if (uptime_start_dt < now_month) else uptime_start_dt
+                uptime_this_month += uptime_stop_dt - use_start
+            uptime_start_dt = datetime.datetime.strptime(vm_dict['last_start_uptime_record']["start"], '%Y-%m-%dT%H:%M:%S.%f%z')
+            use_start = now_month if (uptime_start_dt < now_month) else uptime_start_dt
+            uptime_this_month += now_time - use_start
+
+        print("Uptime this month: {} days, {} seconds".format(uptime_this_month.days, uptime_this_month.seconds))
+
+        vm_dict['uptime_this_month'] = (uptime_this_month.days * 1440.0) + (uptime_this_month.seconds / 60.0)
+
+        machine_class = vm_dict['machine_type'].split('-')[0]
+        discount_tables = _build_sustained_discount_table()
+        if machine_class in discount_tables:
+            candidate = None
+            for slot in discount_tables[machine_class]:
+                if vm_dict['uptime_this_month'] > slot['min_minutes_uptime']:
+                    candidate = slot
+                    print(candidate)
+                else:
+                    break
+
+            print("We have discount {} for uptime {}".format(candidate['multiplier'], vm_dict['uptime_this_month']))
+            vm_dict['current_discount'] = candidate['multiplier']
+        else:
+            vm_dict['current_discount'] = 1.0
+
+        #
+        # For the VM, fill in the runtime for hour slots back to the beginning of our series, or to the last
+        # start time of the VM, whichever is later. Don't touch older slots, if they exist. Make it so we build
+        # the whole series from scratch the first time, and also that we throw out old entries we don't care
+        # about anymore:
+        #
+
+        vm_dict['usage'] = _fill_time_series(now_hour, now_time, machine_info['started'], vm_dict['usage'])
     return
+
+
+'''
+----------------------------------------------------------------------------------------------
+The sustained discount table:
+'''
+
+def _build_sustained_discount_table():
+
+    # 730 hour month = 43800 minutes
+    # 25% = 10950
+    # 50% = 21900
+    # 75% = 32850
+    # n1: General-purpose N1 predefined and custom machine types, memory-optimized machine types,
+    # shared-core machine types, and sole-tenant nodes (e.g. n1-standard-1)
+    # n2: General-purpose N2 and N2D predefined and custom machine types, and Compute-optimized machine types
+    # (e.g. c2-standard-4)
+
+    discount_table = {
+        'n1': [
+            {'min_minutes_uptime': 0, 'multiplier' : 1.0}, # 0%-25%
+            {'min_minutes_uptime': 10950, 'multiplier': 0.8}, # 25%-50%
+            {'min_minutes_uptime': 21900, 'multiplier': 0.6}, # 50%-75%
+            {'min_minutes_uptime': 32850, 'multiplier': 0.4} # 75%-100%
+        ],
+        'n2': [
+            {'min_minutes_uptime': 0, 'multiplier': 1.0},  # 0%-25%
+            {'min_minutes_uptime': 10950, 'multiplier': 0.8678},  # 25%-50%
+            {'min_minutes_uptime': 21900, 'multiplier': 0.733},  # 50%-75%
+            {'min_minutes_uptime': 32850, 'multiplier': 0.6}  # 75%-100%
+        ]
+    }
+
+    return discount_table
 
 '''
 ----------------------------------------------------------------------------------------------
@@ -549,6 +811,7 @@ Return information on all VMs in the project:
 def _check_compute_engine_inventory_aggregate(service, project_id):
 
     instance_dict = {}
+    stopped_dict = {}
     type_dict = {}
     total_cpus = 0
 
@@ -560,66 +823,70 @@ def _check_compute_engine_inventory_aggregate(service, project_id):
             if "warning" in instance_scoped_list and instance_scoped_list["warning"]["code"] == 'NO_RESULTS_ON_PAGE':
                 continue
             for instance in instance_scoped_list['instances']:
-                total_cpus += _describe_running_instance(project_id, zone.split('/')[-1], service, instance, instance_dict, type_dict)
+                total_cpus += _describe_instance(project_id, zone.split('/')[-1], service,
+                                                 instance, instance_dict, type_dict, stopped_dict)
         request = service.instances().aggregatedList_next(previous_request=request, previous_response=response)
 
-    return instance_dict, type_dict, total_cpus
+    return instance_dict, type_dict, total_cpus, stopped_dict
 
 '''
 ----------------------------------------------------------------------------------------------
-# Describe a running instance:
+# Describe an instance:
 '''
-def _describe_running_instance(project_id, zone, compute, item, instance_dict, type_dict):
+def _describe_instance(project_id, zone, compute, item, instance_dict, type_dict, stopped_dict):
 
     cpu_count = 0
+
+    accel_inventory = []
+    if 'guestAccelerators' in item:
+        for accel in item['guestAccelerators']:
+            type_chunks = accel['acceleratorType'].split('/')
+            accel_entry = {
+                'count': int(accel['acceleratorCount']),
+                'zone': type_chunks[-3],
+                'type': type_chunks[-1]
+            }
+            print("Accelerator: %i %s %s" % (accel_entry['count'], accel_entry['zone'], accel_entry['type']))
+            accel_inventory.append(accel_entry)
+
+    machine_key = item['machineType'].split('/')[-1]
+    instance_info = {'zone': zone,
+                     'id': item['id'],
+                     'name': item['name'],
+                     'status': item['status'],
+                     'created': item['creationTimestamp'],
+                     'started': item['lastStartTimestamp'],
+                     'lastStop': item['lastStopTimestamp'] if 'lastStopTimestamp' in item else None,
+                     'machineType': machine_key,
+                     'firstDiskSize': item['disks'][0]['diskSizeGb'],
+                     'firstDiskKind': item['disks'][0]['kind'],
+                     'firstDiskFirstLicense': item['disks'][0]['licenses'][0].split('/')[-1],
+                     'preemptible': item['scheduling']['preemptible'],
+                     'accelerator_inventory': accel_inventory,
+                     'cpus': 0.0
+                     }
+
+    full_key = (zone, machine_key)
+    if full_key not in type_dict:
+        request = compute.machineTypes().get(project=project_id, zone=zone, machineType=instance_info['machineType'])
+        response = request.execute()
+        machine_info = {'name': response['name'],
+                        'cpus': float(response['guestCpus']),
+                        'memory': int(response['memoryMb']),
+                        'zone': response['zone']
+                       }
+        type_dict[full_key] = machine_info
+        instance_info['cpus'] = float(response['guestCpus'])
+    else:
+        instance_info['cpus'] = type_dict[full_key]['cpus']
+
+    full_key = (zone, machine_key, instance_info['cpus'], instance_info['name'], instance_info['id'])
+
     if item['status'] == 'RUNNING':
-        accel_inventory = []
-        if 'guestAccelerators' in item:
-            for accel in item['guestAccelerators']:
-                type_chunks = accel['acceleratorType'].split('/')
-                accel_entry = {
-                    'count': int(accel['acceleratorCount']),
-                    'zone': type_chunks[-3],
-                    'type': type_chunks[-1]
-                }
-                print("Accelerator: %i %s %s" % (accel_entry['count'], accel_entry['zone'], accel_entry['type']))
-                accel_inventory.append(accel_entry)
-
-        machine_key = item['machineType'].split('/')[-1]
-        instance_info = {'zone': zone,
-                         'id': item['id'],
-                         'name': item['name'],
-                         'status': item['status'],
-                         'created': item['creationTimestamp'],
-                         'started': item['lastStartTimestamp'],
-                         'lastStop': item['lastStopTimestamp'] if 'lastStopTimestamp' in item else None,
-                         'machineType': machine_key,
-                         'firstDiskSize': item['disks'][0]['diskSizeGb'],
-                         'firstDiskKind': item['disks'][0]['kind'],
-                         'firstDiskFirstLicense': item['disks'][0]['licenses'][0].split('/')[-1],
-                         'preemptible': item['scheduling']['preemptible'],
-                         'accelerator_inventory': accel_inventory,
-                         'cpus': 0.0
-                         }
-
-        full_key = (zone, machine_key)
-        if full_key not in type_dict:
-            request = compute.machineTypes().get(project=project_id, zone=zone, machineType=instance_info['machineType'])
-            response = request.execute()
-            machine_info = {'name': response['name'],
-                            'cpus': float(response['guestCpus']),
-                            'memory': int(response['memoryMb']),
-                            'zone': response['zone']
-                           }
-            type_dict[full_key] = machine_info
-            instance_info['cpus'] = float(response['guestCpus'])
-        else:
-            instance_info['cpus'] = type_dict[full_key]['cpus']
-
-        full_key = (zone, machine_key, instance_info['cpus'], instance_info['name'])
         cpu_count += instance_info['cpus']
         instance_dict[full_key] = instance_info
-
+    else: # machine is not running:
+        stopped_dict[full_key] = instance_info
     return cpu_count
 
 '''
@@ -668,7 +935,7 @@ def _process_shutdown_list(project_id, stop_list):
                 names_by_zone[zone] = names_in_zone
             else:
                 names_in_zone = names_by_zone[zone]
-            names_in_zone.append(zone_and_name[1])
+            names_in_zone.append(zone_and_name[3])
 
         compute = discovery.build('compute', 'v1', cache_discovery=False)
         instances = compute.instances()
@@ -775,6 +1042,7 @@ def _gather_vm_skus(machine_info, vm_pricing_cache, gpu_pricing_cache, vm_dict):
         else:
             raise Exception("No VM pricing found")
 
+    vm_dict['cpus_per_core'] = price_lineitem[9]
     vm_dict["skus"]["vm_sku"] = {price_lineitem[7]: price_lineitem}
     vm_dict["skus"]["ram_sku"] = {price_lineitem[8]: price_lineitem}
 
@@ -925,8 +1193,14 @@ def _core_and_ram_and_gpu_cost(hours, vm_dict, cost_per_sku):
     else:
         no_calc = True
     if not no_calc:
-        # Machine type includes the CPU count. Do not multiply by CPU count!
-        this_sku = hours * core_per_hour
+        #
+        # Originally multiplied by cpu count. But then when testing on e2-medium machines, that gave the
+        # wrong answer. It looked like the CPU count (2 CPUs) was not applicable. So I dropped
+        # that factor. But that was wrong! The e2-micro, e2-small, and e2-medium machines all have 2 CPUs,
+        # but a different number of CPUs "per core", and pricing is actually by core. So, there is now a
+        # BQ table field for "cpus per core", and that needs to be used as well as CPU count.
+        #
+        this_sku = hours * core_per_hour * (vm_dict['cpus'] / vm_dict['cpus_per_core'])
         if cpu_price_lineitem[7] in cost_per_sku:
             this_sku += cost_per_sku[cpu_price_lineitem[7]]
         cost_per_sku[cpu_price_lineitem[7]] = this_sku
@@ -936,7 +1210,8 @@ def _core_and_ram_and_gpu_cost(hours, vm_dict, cost_per_sku):
             this_sku += cost_per_sku[cpu_price_lineitem[8]]
         cost_per_sku[cpu_price_lineitem[8]] = this_sku
 
-        machine_cost = (hours * core_per_hour) + (hours * vm_dict['memory_gb'] * gb_per_hour)
+        machine_cost = hours * core_per_hour * (vm_dict['cpus'] / vm_dict['cpus_per_core']) + \
+                       (hours * vm_dict['memory_gb'] * gb_per_hour)
     else:
         raise Exception("unexpected pricing units: {} {}".format(cpu_price_lineitem[4], ram_price_lineitem[6]))
 
@@ -1209,7 +1484,7 @@ def _pull_vm_pricing(machine_key, preemptible, region, cpu_table_name, ram_table
             if vm_costs is None:
                 vm_costs = (row.machine_key, row.preemptible, row.region,
                             row.cpu_max_usd, row.cpu_pricing_unit, row.ram_max_usd, row.ram_pricing_unit,
-                            row.cpu_sku_id, row.ram_sku_id)
+                            row.cpu_sku_id, row.ram_sku_id, row.cpus_per_core)
             else:
                 print(row)
                 print("Too many vm cost results")
@@ -1227,6 +1502,7 @@ def _machine_cost_sql(machine_key, preemptible, region, cpu_table_name, ram_tabl
           machine_key,
           mk2c.cpu as cpu,
           mk2c.ram as ram,
+          mk2c.cpus_per_core as cpus_per_core,
           cpup.preemptible,
           cpup.region,
           cpup.sku_id,
@@ -1242,6 +1518,7 @@ def _machine_cost_sql(machine_key, preemptible, region, cpu_table_name, ram_tabl
         SELECT a1.machine_key,
                a1.cpu,
                a1.ram,
+               a1.cpus_per_core,
                a1.preemptible,
                a1.region,
                a1.sku_id as cpu_sku_id,
