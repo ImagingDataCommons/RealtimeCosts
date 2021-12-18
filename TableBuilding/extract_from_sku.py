@@ -212,6 +212,38 @@ def generate_bq_table_sql(sku_table):
         AND sku.description LIKE "%Analysis%"
         '''.format(sku_table)
 
+
+'''
+----------------------------------------------------------------------------------------------
+Extract Cloud Storage related skus from the whole-sku table exported by Google
+'''
+def generate_gcs_table(sku_table, target_dataset, dest_table, do_batch):
+
+    sql = generate_gcs_table_sql(sku_table)
+    return generic_bq_harness(sql, target_dataset, dest_table, do_batch, True)
+
+'''
+----------------------------------------------------------------------------------------------
+SQL for above
+'''
+def generate_gcs_table_sql(sku_table):
+    return '''
+        SELECT DISTINCT service.description as service_desc,
+               sku.id,
+               sku.description as sku_desc,
+               geo_taxonomy.type,
+               pricing_unit,
+               tr.start_usage_amount,
+               tr.usd_amount
+        FROM `idc-external-admin.idc_external_skus.cloud_pricing_export`,
+        UNNEST(billing_account_price.tiered_rates) as tr
+        WHERE DATE(_PARTITIONTIME) = "2021-12-17"
+        AND service.description = "Cloud Storage"
+        AND sku.description LIKE "%Storage%"
+        AND sku.description NOT LIKE "%gress%"
+        '''.format(sku_table)
+
+
 '''
 ----------------------------------------------------------------------------------------------
 Extract ip address related skus from the whole-sku table exported by Google
@@ -605,18 +637,24 @@ def main(args):
             print("Build bq table failed")
             return
 
+    if 'build_gcs_pricing' in steps:
+        success = generate_gcs_table(params['SKU_TABLE'], params['TARGET_DATASET'], params['GCS_PRICING'], params['BQ_AS_BATCH'])
+        if not success:
+            print("Build gcs table failed")
+            return
+
     if 'print_env_vars' in steps:
         print("Environment variables for function, using these tables:")
         for table_map in mappings:
             dest_table, table_dict = next(iter(table_map.items()))
             print("{}={}.{}.{}".format(table_dict['env'], params['WORKING_PROJECT'], params['TARGET_DATASET'], dest_table))
 
-
         print("CPU_PRICES={}.{}.{}".format(params['WORKING_PROJECT'], params['TARGET_DATASET'], params['CPU_PRICING']))
         print("RAM_PRICES={}.{}.{}".format(params['WORKING_PROJECT'], params['TARGET_DATASET'], params['RAM_PRICING']))
         print("GPU_PRICES={}.{}.{}".format(params['WORKING_PROJECT'], params['TARGET_DATASET'], params['GPU_PRICING']))
         print("PD_PRICES={}.{}.{}".format(params['WORKING_PROJECT'], params['TARGET_DATASET'], params['PD_PRICING']))
         print("IP_PRICES={}.{}.{}".format(params['WORKING_PROJECT'], params['TARGET_DATASET'], params['IP_PRICING']))
+        print("GCS_PRICES={}.{}.{}".format(params['WORKING_PROJECT'], params['TARGET_DATASET'], params['GCS_PRICING']))
         print("CPU_LIC_PRICES={}.{}.{}".format(params['WORKING_PROJECT'], params['TARGET_DATASET'], params['CPU_LIC_PRICING']))
         print("GPU_LIC_PRICES={}.{}.{}".format(params['WORKING_PROJECT'], params['TARGET_DATASET'], params['GPU_LIC_PRICING']))
         print("RAM_LIC_PRICES={}.{}.{}".format(params['WORKING_PROJECT'], params['TARGET_DATASET'], params['RAM_LIC_PRICING']))
