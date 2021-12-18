@@ -328,7 +328,7 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
                 #if vm_dict['status'] == "RUNNING":
                 minutes_running = vm_dict["usage"][clock_time] if clock_time in vm_dict["usage"] else 0.0
                 print("FIXME! VMs never seen and not running have empty SKU fields")
-                _core_and_ram_and_gpu_cost(minutes_running/60, clock_time, vm_dict, cost_per_sku, discount_per_sku, discount_tables)
+                _core_and_ram_and_gpu_cost(minutes_running/60, vm_dict, cost_per_sku)
                 _calc_licensing_cost(minutes_running/60, vm_dict, cost_per_sku)
             for k, pd_dict in all_pd_dict.items():
                 minutes_running = pd_dict["usage"][clock_time] if clock_time in pd_dict["usage"] else 0.0
@@ -589,7 +589,7 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
 Estimate_current_storage_costs
 '''
 
-def _estimate_current_storage_costs(project_id, charge_hist, usage_hours, master_chart, now_month, bq_pricing_cache):
+def _estimate_current_storage_costs(project_id, charge_hist, usage_hours, master_chart, now_time, bq_pricing_cache):
 
 
     storage_points = []
@@ -598,8 +598,6 @@ def _estimate_current_storage_costs(project_id, charge_hist, usage_hours, master
             if k == "5F7A-5173-CF5B":
                 new_point = [dicto["usage_start_time"].timestamp(), dicto["total_cost"]]
                 storage_points.append(new_point)
-
-
 
         '''
         df is a list of list of float values
@@ -612,13 +610,6 @@ def _estimate_current_storage_costs(project_id, charge_hist, usage_hours, master
 
     now_store = (now_time.timestamp() * slope) + intercept
     print("store_cost", now_store)
-
-
-
-
-
-
-
 
 
 '''
@@ -2235,7 +2226,7 @@ def _add_machine_resource_tokens(vm_dict, resource_key):
 Compute the cost of the given machine over the given number of hours:
 '''
 
-def _core_and_ram_and_gpu_cost(hours, clock_time, vm_dict, cost_per_sku, discount_per_sku, discount_tables):
+def _core_and_ram_and_gpu_cost(hours, vm_dict, cost_per_sku):
 
     cpu_price_lineitem = None
     if vm_dict["skus"]["vm_sku"] is None:
@@ -2256,35 +2247,8 @@ def _core_and_ram_and_gpu_cost(hours, clock_time, vm_dict, cost_per_sku, discoun
             print("Multiple RAM SKUs")
             break
 
-    if 'cpu_discounts_per_hour' in vm_dict and (clock_time in vm_dict['cpu_discounts_per_hour']):
-        cpu_discounts = vm_dict['cpu_discounts_per_hour'][clock_time]
-    elif ('cpu_tokens' in vm_dict) and (len(vm_dict['cpu_tokens']) > 0):
-        cpu_discounts = []
-        for key, tok_list in vm_dict['cpu_tokens'].items():
-            for token in tok_list:
-                minutes = token['current_usage'] + token['prior_usage']
-                cpu_discount = _get_sustained_discount_for_minutes(minutes, vm_dict['machine_type'], discount_tables)
-                cpu_discounts.append(cpu_discount)
-        print(cpu_discounts)
-        print("FIXME: no only modify the current hour!")
-        if 'cpu_discounts_per_hour' in vm_dict:
-            if clock_time in vm_dict['cpu_discounts_per_hour']:
-                if vm_dict['cpu_discounts_per_hour'][clock_time] != cpu_discounts:
-                    print("FIXME: Gotta handle discount switch")
-            vm_dict['cpu_discounts_per_hour'][clock_time] = cpu_discounts
-        else:
-            vm_dict['cpu_discounts_per_hour'] = {clock_time: cpu_discounts}
-    else:
-        cpu_discounts = None
-
-    ram_discounts = []
-    if ('ram_tokens' in vm_dict) and len(vm_dict['ram_tokens']) > 0:
-        for key, tok_list in vm_dict['ram_tokens'].items():
-            for token in tok_list:
-                minutes = token['current_usage'] + token['prior_usage']
-                ram_discount = _get_sustained_discount_for_minutes(minutes, vm_dict['machine_type'], discount_tables)
-                ram_discounts.append(ram_discount)
-        print(ram_discounts)
+    if 'cpu_discounts_per_hour' in vm_dict: # FIXME DEV ONLY
+        vm_dict.pop('cpu_discounts_per_hour')
 
     core_per_hour = 0.0
     gb_per_hour = 0.0
@@ -2318,41 +2282,6 @@ def _core_and_ram_and_gpu_cost(hours, clock_time, vm_dict, cost_per_sku, discoun
 
         ram_sku = cpu_price_lineitem[8]
         this_ram_sku = hours * vm_dict['memory_gb'] * gb_per_hour
-
-        #
-        # This is the running total across ALL machines in the machine class:
-        #
-        cost_per_sku[ram_sku] = (this_ram_sku + cost_per_sku[ram_sku]) if (ram_sku in cost_per_sku) else this_ram_sku
-
-        if cpu_discounts is not None:
-            if vm_dict['cpus_per_core'] != 1:
-                raise Exception("UNEXPECTED CPUS PER CORE")
-            num_cpus = int(round(vm_dict['cpus']))
-            if num_cpus != len(cpu_discounts):
-                raise Exception("UNEXPECTED CPU TOKEN COUNT")
-            discounted_cost = 0.0
-            list_cost = 0.0
-            for i in range(0, num_cpus):
-                discounted_cost += hours * core_per_hour * cpu_discounts[i]
-                list_cost += hours * core_per_hour
-            this_cpu_discount = list_cost - discounted_cost
-            discount_per_sku[cpu_sku] = (this_cpu_discount + discount_per_sku[cpu_sku]) if (cpu_sku in discount_per_sku) else this_cpu_discount
-
-        if len(ram_discounts) > 0:
-            # We can have fractional RAM amounts:
-            ram_frac = vm_dict['memory_gb'] - int(vm_dict['memory_gb'])
-            ram_ceil = int(math.ceil(vm_dict['memory_gb']))
-            discounted_cost = 0.0
-            list_cost = 0.0
-            for i in range(0,ram_ceil):
-                discount = ram_discounts[i]
-                increment = hours * gb_per_hour
-                if i == (ram_ceil - 1):
-                    increment *= ram_frac
-                discounted_cost += (increment * discount)
-                list_cost += increment
-            this_ram_discount = list_cost - discounted_cost
-            discount_per_sku[ram_sku] = (this_ram_discount + discount_per_sku[ram_sku]) if (ram_sku in discount_per_sku) else this_ram_discount
 
     else:
         raise Exception("unexpected pricing units: {} {}".format(cpu_price_lineitem[4], ram_price_lineitem[6]))
