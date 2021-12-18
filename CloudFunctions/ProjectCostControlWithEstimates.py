@@ -39,6 +39,7 @@ RAM_PRICES = os.environ["RAM_PRICES"]
 GPU_PRICES = os.environ["GPU_PRICES"]
 PD_PRICES = os.environ["PD_PRICES"]
 BQ_PRICES = os.environ["BQ_PRICES"]
+GCS_PRICES = os.environ["GCS_PRICES"]
 CPU_LIC_PRICES = os.environ["CPU_LIC_PRICES"]
 GPU_LIC_PRICES = os.environ["GPU_LIC_PRICES"]
 RAM_LIC_PRICES = os.environ["RAM_LIC_PRICES"]
@@ -174,52 +175,8 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
     cost_logger = log_client.logger("cost_estimation_log")
 
     if not only_estimate_burn:
-
-        #
-        # Get the state for the budget:
-        #
-
-        state_blob = "{}_state.json".format(project_id)
-        week_num = now_time.strftime("%V")
-
-        blob = bucket.blob(state_blob)
-        blob_str = blob.download_as_string() if blob.exists() else b''
-        raw_budget_state = {"budget": budget_amount, "messages": {}, "amounts": {cis: 0}} if (blob_str == b'') else json.loads(blob_str)
-        # Bring old dicts up to speed. Messages were added before budget, so this order catches all cases:
-        if "messages" not in raw_budget_state:
-            budget_super_state = {"messages": {}, "amounts": raw_budget_state}
-        else:
-            budget_super_state = raw_budget_state
-
-        if ("budget" not in budget_super_state) or (budget_super_state['budget'] != budget_amount):
-            budget_super_state['budget'] = budget_amount
-
-        budget_state = budget_super_state['amounts']
-        budget_state[cis] = cost_amount
-        message_state = budget_super_state['messages']
-
-        #
-        # How much is being spent to move data around:
-        #
-
-        total_egress = float(_calc_egress(COST_BQ, project_id))
-        print("Project {} total egress and download: {}".format(project_id, total_egress))
-        egress_thresh = EGRESS_NOTIFY_MULTIPLIER * float(budget_amount)
-        if total_egress > egress_thresh:
-            message_key = message_root_fmt.format("1")
-            fire_off = (message_key not in message_state) or message_state[message_key] != week_num
-            if fire_off:
-                print("{}: Project {} total egress and download ({}) exceeds threshold {} ".format(message_key, project_id, total_egress, egress_thresh))
-                message_state[message_key] = week_num
-
-        #
-        # Stash the latest cost data and message status back in the bucket before we wander off and do things, just in
-        # case everything goes nuts:
-        #
-
-        # Seems we get a checksum complaint if we don't reinitialize the blob:
-        blob = bucket.blob(state_blob)
-        blob.upload_from_string(json.dumps(budget_super_state, indent=4, sort_keys=True))
+        _process_budget_state(project_id, bucket, now_time, budget_amount,
+                              cost_amount, cis, message_root_fmt)
 
     #
     # We want to limit the number of instances that can be run without having to set a quota. We also want to
@@ -238,38 +195,15 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
     is_enabled = _check_compute_services_for_project(project_id)
     if is_enabled:
         compute = discovery.build('compute', 'v1', cache_discovery=False)
-        running_inventory, type_dict, total_cpus, stopped_inventory = \
-            _check_compute_engine_inventory_aggregate(compute, project_id)
-        all_vm_dict = burn_state['vm_instances']
-        # Handle stopped machines first, to insure their cpu tokens can be swapped by running machines
-        # in this iteration
-        for k, v in stopped_inventory.items():
-            _build_vm_inventory(v, type_dict, now_hour, now_time, now_month, last_inventory_time,
-                                all_vm_dict, discount_tables)
-            all_ids.add(k[4])
-            machine_class = k[1].split('-')[0]
-            is_preempt = all_vm_dict[k[4]]['preempt']
-            if machine_class in discount_classes and not is_preempt:
-                _calc_advanced_sustained_use(k[4], all_vm_dict, burn_state, roll_discount_tokens)
-        for k, v in running_inventory.items():
-            _build_vm_inventory(v, type_dict, now_hour, now_time, now_month, last_inventory_time,
-                                all_vm_dict, discount_tables)
-            all_ids.add(k[4])
-            machine_class = k[1].split('-')[0]
-            is_preempt = all_vm_dict[k[4]]['preempt']
-            if machine_class in discount_classes and not is_preempt:
-                _calc_advanced_sustained_use(k[4], all_vm_dict, burn_state, roll_discount_tokens)
+        total_cpus = _prepare_inventory(compute, burn_state, project_id, now_hour, now_time, now_month,
+                                        last_inventory_time, discount_tables, roll_discount_tokens,
+                                        discount_classes, all_ids)
         print("Project {} cpu count {}".format(project_id, total_cpus))
         if (not only_estimate_burn) and (total_cpus > MAX_CPUS):
             message_key = message_root_fmt.format("3")
             shutdown = total_cpus - MAX_CPUS
             print("{}: Project {} is over CPU limit: {} Shutting down {}".format(message_key, project_id, total_cpus, shutdown))
             excess_vm_stop_list = _prepare_shutdown_list(running_inventory, shutdown)
-
-        all_pd_dict = burn_state['pdisks']
-        disk_inventory = _check_persistent_disk_inventory_aggregate(compute, project_id)
-        for disk in disk_inventory:
-            _build_pd_inventory(disk, now_hour, now_time, all_pd_dict)
 
     else:
         type_dict = None
@@ -412,7 +346,9 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
             if k not in sku_desc:
                 sku_desc[k] = dicto['sku_description']
 
-    _estimate_current_storage_costs(chist, now_time)
+    storage_est = _estimate_current_storage_costs(chist, now_time)
+    for sku_id, price in storage_est.items():
+        print("Storage ", sku_id, price)
 
     #
     # All skus that show up in the Google dump need to be present at all time points. This is to
@@ -428,13 +364,13 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
     #
 
 
-    for goog_time, sku_records in master_chart.items():
-        for sku in sku_set:
-            if sku not in sku_records:
-                goog_val = google_max[sku] if (sku in google_max) else 0.0
-                # FIXME: THIS IS NOT A GOOGLE VALUE, BUT A CALC VALUE
-                sku_record = {"calc": 0.0, "goog": goog_val, "disc": 0.0}
-                sku_records[sku] = sku_record
+    #for goog_time, sku_records in master_chart.items():
+    #    for sku in sku_set:
+    #        if sku not in sku_records:
+    #            goog_val = google_max[sku] if (sku in google_max) else 0.0
+    #            # FIXME: THIS IS NOT A GOOGLE VALUE, BUT A CALC VALUE
+    #            sku_record = {"calc": 0.0, "goog": goog_val, "disc": 0.0}
+    #            sku_records[sku] = sku_record
 
     #
     # Dump out the sku records:
@@ -567,30 +503,135 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
 
 '''
 ----------------------------------------------------------------------------------------------
+process budget state obtained from budget pub/sub, if we are being called in that fashion
+'''
+
+def _process_budget_state(project_id, bucket, now_time, budget_amount, cost_amount, cis, message_root_fmt):
+    #
+    # Get the state for the budget:
+    #
+
+    state_blob = "{}_state.json".format(project_id)
+    week_num = now_time.strftime("%V")
+
+    blob = bucket.blob(state_blob)
+    blob_str = blob.download_as_string() if blob.exists() else b''
+    raw_budget_state = {"budget": budget_amount, "messages": {}, "amounts": {cis: 0}} if (
+    blob_str == b'') else json.loads(blob_str)
+    # Bring old dicts up to speed. Messages were added before budget, so this order catches all cases:
+    if "messages" not in raw_budget_state:
+        budget_super_state = {"messages": {}, "amounts": raw_budget_state}
+    else:
+        budget_super_state = raw_budget_state
+
+    if ("budget" not in budget_super_state) or (budget_super_state['budget'] != budget_amount):
+        budget_super_state['budget'] = budget_amount
+
+    budget_state = budget_super_state['amounts']
+    budget_state[cis] = cost_amount
+    message_state = budget_super_state['messages']
+
+    #
+    # How much is being spent to move data around:
+    #
+
+    total_egress = float(_calc_egress(COST_BQ, project_id))
+    print("Project {} total egress and download: {}".format(project_id, total_egress))
+    egress_thresh = EGRESS_NOTIFY_MULTIPLIER * float(budget_amount)
+    if total_egress > egress_thresh:
+        message_key = message_root_fmt.format("1")
+        fire_off = (message_key not in message_state) or message_state[message_key] != week_num
+        if fire_off:
+            print("{}: Project {} total egress and download ({}) exceeds threshold {} ".format(message_key, project_id,
+                                                                                               total_egress,
+                                                                                               egress_thresh))
+            message_state[message_key] = week_num
+
+    #
+    # Stash the latest cost data and message status back in the bucket before we wander off and do things, just in
+    # case everything goes nuts:
+    #
+
+    # Seems we get a checksum complaint if we don't reinitialize the blob:
+    blob = bucket.blob(state_blob)
+    blob.upload_from_string(json.dumps(budget_super_state, indent=4, sort_keys=True))
+    return
+
+'''
+----------------------------------------------------------------------------------------------
+prepare VM inventory
+'''
+
+def _prepare_inventory(compute, burn_state, project_id, now_hour, now_time, now_month,
+                       last_inventory_time, discount_tables, roll_discount_tokens,
+                       discount_classes, all_ids):
+
+    running_inventory, type_dict, total_cpus, stopped_inventory = \
+        _check_compute_engine_inventory_aggregate(compute, project_id)
+    all_vm_dict = burn_state['vm_instances']
+    # Handle stopped machines first, to insure their cpu tokens can be swapped by running machines
+    # in this iteration
+    for k, v in stopped_inventory.items():
+        _build_vm_inventory(v, type_dict, now_hour, now_time, now_month, last_inventory_time,
+                            all_vm_dict, discount_tables)
+        all_ids.add(k[4])
+        machine_class = k[1].split('-')[0]
+        is_preempt = all_vm_dict[k[4]]['preempt']
+        if machine_class in discount_classes and not is_preempt:
+            _calc_advanced_sustained_use(k[4], all_vm_dict, burn_state, roll_discount_tokens)
+    for k, v in running_inventory.items():
+        _build_vm_inventory(v, type_dict, now_hour, now_time, now_month, last_inventory_time,
+                            all_vm_dict, discount_tables)
+        all_ids.add(k[4])
+        machine_class = k[1].split('-')[0]
+        is_preempt = all_vm_dict[k[4]]['preempt']
+        if machine_class in discount_classes and not is_preempt:
+            _calc_advanced_sustained_use(k[4], all_vm_dict, burn_state, roll_discount_tokens)
+
+    all_pd_dict = burn_state['pdisks']
+    disk_inventory = _check_persistent_disk_inventory_aggregate(compute, project_id)
+    for disk in disk_inventory:
+        _build_pd_inventory(disk, now_hour, now_time, all_pd_dict)
+
+    return total_cpus
+
+
+'''
+----------------------------------------------------------------------------------------------
 Estimate_current_storage_costs
 '''
 
 def _estimate_current_storage_costs(charge_hist, now_time):
 
-    storage_points = []
+    retval = {}
+    now_stamp = now_time.timestamp()
+    gcs_skus = _get_gcs_skus(GCS_PRICES)
+    storage_points_per_sku = {}
+
     for k, hist in charge_hist.items():
         for dicto in hist:
-            if k == "5F7A-5173-CF5B":
+            if k in gcs_skus:
+                if k in storage_points_per_sku:
+                    storage_points = storage_points_per_sku[k]
+                else:
+                    storage_points = []
+                    storage_points_per_sku[k] = storage_points
+
                 new_point = [dicto["usage_start_time"].timestamp(), dicto["total_cost"]]
                 storage_points.append(new_point)
 
-        '''
-        df is a list of list of float values
-        '''
+    for k, points in storage_points_per_sku.items():
+        if len(points) == 1:
+            retval[k] = points[0][1]
+        else:
+            slope, intercept = best_fit(points)
+            now_store = (now_stamp * slope) + intercept
+            if now_store < 0.0:
+                retval[k] = 0.0
+            else:
+                retval[k] = now_store
 
-    for point in storage_points:
-        print(point)
-
-    slope, intercept = best_fit(storage_points)
-
-    now_store = (now_time.timestamp() * slope) + intercept
-    print("store_cost", now_store)
-    return
+    return retval
 
 '''
 ----------------------------------------------------------------------------------------------
@@ -3180,6 +3221,33 @@ def _get_billing_account_ip_usage_sql(table_name, first_of_month):
       AND usage_start_time >= "{1}"
       GROUP BY location, usage.pricing_unit
     '''.format(table_name, first_of_month)
+    return sql
+
+'''
+----------------------------------------------------------------------------------------------
+Get the SKUs for storage-related items
+'''
+def _get_gcs_skus(sku_table):
+    sql = _get_gcs_skus_sql(sku_table)
+    results = _bq_harness_with_result(sql, False)
+    gcs_skus = []
+    if results is not None:
+        for row in results:
+            gcs_skus.append(row.sku_id)
+    return gcs_skus
+
+'''
+----------------------------------------------------------------------------------------------
+SQL for above
+'''
+
+def _get_gcs_skus_sql(table_name):
+
+    sql = '''
+      SELECT DISTINCT
+      id as sku_id
+      FROM `{0}`
+    '''.format(table_name)
     return sql
 
 '''
