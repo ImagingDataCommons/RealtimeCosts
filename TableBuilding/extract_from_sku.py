@@ -184,6 +184,36 @@ def generate_pd_table_sql(sku_table):
 
 '''
 ----------------------------------------------------------------------------------------------
+Extract BigQuery related skus from the whole-sku table exported by Google
+'''
+def generate_bq_table(sku_table, target_dataset, dest_table, do_batch):
+
+    sql = generate_bq_table_sql(sku_table)
+    return generic_bq_harness(sql, target_dataset, dest_table, do_batch, True)
+
+'''
+----------------------------------------------------------------------------------------------
+SQL for above
+'''
+def generate_bq_table_sql(sku_table):
+    return '''
+        SELECT DISTINCT service.description as service_desc,
+               sku.id,
+               sku.description as sku_desc,
+               geo_taxonomy.type,
+               gt_region,
+               pricing_unit,
+               tr.start_usage_amount,
+               tr.usd_amount
+        FROM `{0}`,
+        UNNEST(billing_account_price.tiered_rates) as tr,
+        UNNEST(geo_taxonomy.regions) as gt_region
+        WHERE service.description LIKE "%BigQuery%"
+        AND sku.description LIKE "%Analysis%"
+        '''.format(sku_table)
+
+'''
+----------------------------------------------------------------------------------------------
 Extract ip address related skus from the whole-sku table exported by Google
 '''
 def generate_ip_table(sku_table, target_dataset, dest_table, do_batch):
@@ -569,11 +599,18 @@ def main(args):
             print("Build ip table failed")
             return
 
+    if 'build_bq_pricing' in steps:
+        success = generate_bq_table(params['SKU_TABLE'], params['TARGET_DATASET'], params['BQ_PRICING'], params['BQ_AS_BATCH'])
+        if not success:
+            print("Build bq table failed")
+            return
+
     if 'print_env_vars' in steps:
         print("Environment variables for function, using these tables:")
         for table_map in mappings:
             dest_table, table_dict = next(iter(table_map.items()))
             print("{}={}.{}.{}".format(table_dict['env'], params['WORKING_PROJECT'], params['TARGET_DATASET'], dest_table))
+
 
         print("CPU_PRICES={}.{}.{}".format(params['WORKING_PROJECT'], params['TARGET_DATASET'], params['CPU_PRICING']))
         print("RAM_PRICES={}.{}.{}".format(params['WORKING_PROJECT'], params['TARGET_DATASET'], params['RAM_PRICING']))
@@ -590,3 +627,67 @@ def main(args):
 
 if __name__ == "__main__":
     main(sys.argv)
+
+
+
+
+
+'''
+
+
+
+
+        SELECT DISTINCT service.description as service_desc,
+               sku.id,
+               sku.description as sku_desc,
+               geo_taxonomy.type,
+               gt_region,
+               pricing_unit,
+               tr.start_usage_amount,
+               tr.usd_amount
+        FROM `idc-external-admin.idc_external_skus.cloud_pricing_export`,
+        UNNEST(billing_account_price.tiered_rates) as tr,
+        UNNEST(geo_taxonomy.regions) as gt_region
+        WHERE service.description LIKE "%BigQuery%"
+
+
+        SELECT DISTINCT service.description as service_desc,
+               sku.id,
+               sku.description as sku_desc,
+               geo_taxonomy.type,
+               gt_region,
+               pricing_unit,
+               tr.start_usage_amount,
+               tr.usd_amount
+        FROM `idc-external-admin.idc_external_skus.cloud_pricing_export`,
+        UNNEST(billing_account_price.tiered_rates) as tr,
+        UNNEST(geo_taxonomy.regions) as gt_region,
+        WHERE service.description LIKE "%BigQuery%"
+
+
+        SELECT DISTINCT service.description as service_desc,
+               sku.id,
+               sku.description as sku_desc,
+               geo_taxonomy.type,
+               gt_region,
+               pricing_unit,
+               tr.start_usage_amount,
+               tr.usd_amount
+        FROM `idc-external-admin.idc_external_skus.cloud_pricing_export`,
+        UNNEST(billing_account_price.tiered_rates) as tr,
+        UNNEST(geo_taxonomy.regions) as gt_region,
+        WHERE service.description LIKE "%BigQuery%"
+
+        SELECT DISTINCT service.description as service_desc,
+               sku.id,
+               sku.description as sku_desc,
+               pricing_unit,
+               tr.start_usage_amount,
+               tr.usd_amount
+        FROM `idc-external-admin.idc_external_skus.cloud_pricing_export`,
+        UNNEST(billing_account_price.tiered_rates) as tr
+        WHERE service.description LIKE "%BigQuery%"
+
+
+
+'''

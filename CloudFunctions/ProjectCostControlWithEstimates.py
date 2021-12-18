@@ -380,7 +380,6 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
     # these costs is that they lag reality by about 6-12 hours
     #
 
-    storage_points = []
     # FIXME: The non-zero cutoff would prevent us from finding an old cost that dropped to zero
     chist = _get_charge_history_for_sku(COST_BQ, project_id, .00001, SKU_DEPTH, SKU_DAYS)
     for k, hist in chist.items():
@@ -400,11 +399,6 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
 
             sku_record["goog"] += dicto["total_cost"]
 
-
-            if k == "5F7A-5173-CF5B":
-                new_point = [dicto["usage_start_time"].timestamp(), dicto["total_cost"]]
-                storage_points.append(new_point)
-
             #
             # Track the maximum Google cost per sku:
             #
@@ -418,20 +412,7 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
             if k not in sku_desc:
                 sku_desc[k] = dicto['sku_description']
 
-
-
-        '''
-        df is a list of list of float values
-        '''
-
-    for point in storage_points:
-        print(point)
-
-    slope, intercept = best_fit(storage_points)
-
-    now_store = (now_time.timestamp() * slope) + intercept
-    print("store_cost", now_store)
-
+    _estimate_current_storage_costs(chist, now_time)
 
     #
     # All skus that show up in the Google dump need to be present at all time points. This is to
@@ -589,8 +570,7 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
 Estimate_current_storage_costs
 '''
 
-def _estimate_current_storage_costs(project_id, charge_hist, usage_hours, master_chart, now_time, bq_pricing_cache):
-
+def _estimate_current_storage_costs(charge_hist, now_time):
 
     storage_points = []
     for k, hist in charge_hist.items():
@@ -610,7 +590,7 @@ def _estimate_current_storage_costs(project_id, charge_hist, usage_hours, master
 
     now_store = (now_time.timestamp() * slope) + intercept
     print("store_cost", now_store)
-
+    return
 
 '''
 ----------------------------------------------------------------------------------------------
@@ -740,8 +720,6 @@ def _build_vm_inventory(machine_info, type_dict, now_hour, now_time, now_month,
         #
         vm_dict['started'] = machine_info['started']
         vm_dict['last_stop'] = machine_info['lastStop']
-        if 'current_discount' in vm_dict: # FIXME Development cleanup
-            vm_dict.pop('current_discount')
 
         # Deal with stopped machines.
         if vm_dict['status'] != "RUNNING":
