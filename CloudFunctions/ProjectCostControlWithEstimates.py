@@ -1,5 +1,5 @@
 #
-# Copyright 2018 Google LLC
+# Portions Copyright 2018 Google LLC
 # Copyright 2020, 2021 Institute for Systems Biology
 #
 # Licensed under the Apache License, Version 2.0 (the 'License');
@@ -162,7 +162,6 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
     fraction  = 0.0
     total_spend = 0.0
     additional_fees = 0.0
-    total_discounts = 0.0
     per_hour_charge = 0.0
     budget_state = None
     message_state = None
@@ -174,31 +173,47 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
     log_client.setup_logging()
     cost_logger = log_client.logger("cost_estimation_log")
 
+    #
+    # If we are called from a budget alert pub/sub call, we want to get that all tidied up and
+    # processed before we wander off and do realtime estimates:
+    #
+
     if not only_estimate_burn:
         _process_budget_state(project_id, bucket, now_time, budget_amount,
                               cost_amount, cis, message_root_fmt)
 
     #
-    # We want to limit the number of instances that can be run without having to set a quota. We also want to
-    # calculate the current burn rate. Both require an inventory of all VMs in the project:
+    # We want to limit the number of instances that can be run without having to set a quota.
+    # We also want to calculate the current burn rate. Both require an inventory of all VMs
+    # in the project:
     #
 
     excess_vm_stop_list = []
-    running_inventory = {}
-    stopped_inventory = {}
     all_ids = set()
-    disk_inventory = {}
-    all_vm_dict = {}
-    all_pd_dict = {}
+
+    #
+    # We need to initialize discount tokens at the start of each month, or when starting
+    # up the first time:
+    #
+
     roll_discount_tokens = (month_rollover or first_time)
+
+    #
+    # The the Compute Engine service is operational, we go out and inventory all the VMs
+    # (running and stopped), attached GPUs, and persistent disks:
+    #
 
     is_enabled = _check_compute_services_for_project(project_id)
     if is_enabled:
-        compute = discovery.build('compute', 'v1', cache_discovery=False)
-        total_cpus = _prepare_inventory(compute, burn_state, project_id, now_hour, now_time, now_month,
-                                        last_inventory_time, discount_tables, roll_discount_tokens,
-                                        discount_classes, all_ids)
+        running_inventory, disk_inventory, all_pd_dict, all_vm_dict, total_cpus = \
+            _prepare_inventory(burn_state, project_id, now_hour,
+                               now_time, now_month, last_inventory_time, discount_tables,
+                               roll_discount_tokens, list(discount_classes), all_ids)
         print("Project {} cpu count {}".format(project_id, total_cpus))
+        #
+        # If we actually managing (not just monitoring) the project and we have excess VMs, we need
+        # to prepare the chop list of VMs that are going to be shutdown
+        #
         if (not only_estimate_burn) and (total_cpus > MAX_CPUS):
             message_key = message_root_fmt.format("3")
             shutdown = total_cpus - MAX_CPUS
@@ -206,8 +221,10 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
             excess_vm_stop_list = _prepare_shutdown_list(running_inventory, shutdown)
 
     else:
-        type_dict = None
-        compute = None
+        running_inventory = {}
+        disk_inventory = {}
+        all_pd_dict = {}
+        all_vm_dict = {}
         print("Project {} does not have compute enabled".format(project_id))
 
     #
@@ -231,6 +248,8 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
     sku_desc = {}
     master_chart = {}
     google_max = {}
+    sus_use_discounts = None
+    sus_use_discounts_segregated = None
 
     if is_enabled:
         for k, v in running_inventory.items():
@@ -247,9 +266,9 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
         # Figure out the burn rate:
         #
 
+        print("FIXME! VMs never seen and not running have empty SKU fields")
         for clock_time in usage_hours:
             cost_per_sku = {}
-            discount_per_sku = {}
             for k, vm_dict in all_vm_dict.items():
                 # Seeing key errors here if the bookkeeping has fallen over for awhile
                 # e.g. KeyError: '2021-11-15T06+0000'"
@@ -261,7 +280,6 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
                 # FIXME: IMPORTANT!! SKU costs in BQ DO NOT CONTAIN DISCOUNTS. THOSE COSTS ARE LIST PRICE!
                 #if vm_dict['status'] == "RUNNING":
                 minutes_running = vm_dict["usage"][clock_time] if clock_time in vm_dict["usage"] else 0.0
-                print("FIXME! VMs never seen and not running have empty SKU fields")
                 _core_and_ram_and_gpu_cost(minutes_running/60, vm_dict, cost_per_sku)
                 _calc_licensing_cost(minutes_running/60, vm_dict, cost_per_sku)
             for k, pd_dict in all_pd_dict.items():
@@ -277,11 +295,10 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
                 if k in sku_records:
                     sku_record = sku_records[k]
                 else:
-                    sku_record = {"calc": 0.0, "goog": 0.0, "disc": 0.0}
+                    sku_record = {"calc": 0.0, "goog": 0.0}
                     sku_records[k] = sku_record
                 sku_record["calc"] += cost_per_sku[k]
-                if k in discount_per_sku:
-                    sku_record["disc"] += discount_per_sku[k]
+
 
         #
         # We calculate sustained use discounts working with memory and CPU tokens directly. Count up hours
@@ -290,13 +307,16 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
         #
 
         token_resource_use = _calc_unused_tokens(burn_state)
+        token_resource_use_segregated = _calc_unused_tokens_segregated(burn_state)
         for k, vm_dict in all_vm_dict.items():
             vm_region = vm_dict['region']
             machine_class = vm_dict['machine_type'].split('-')[0]
             _calc_running_tokens(vm_dict, token_resource_use, vm_region, machine_class)
+            _calc_running_tokens_segregated(vm_dict, token_resource_use_segregated, vm_region, machine_class)
+
 
         print("sustained use discounts:")
-        _calc_sustained_disc_from_tokens(token_resource_use, discount_tables)
+        sus_use_discounts_segregated = _calc_sustained_disc_from_tokens_segregated(token_resource_use_segregated, discount_tables)
 
 
     ip_usage_for_month = _get_billing_account_ip_usage(COST_BQ, now_month.strftime('%Y-%m-%d'))
@@ -311,13 +331,13 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
 
     #
     # This pulls the actual charge history from the BQ cost export table for this project. The problem with
-    # these costs is that they lag reality by about 6-12 hours
+    # these costs is that they lag reality by about 6-24 hours
     #
 
     # FIXME: The non-zero cutoff would prevent us from finding an old cost that dropped to zero
     chist = _get_charge_history_for_sku(COST_BQ, project_id, .00001, SKU_DEPTH, SKU_DAYS)
-    for k, hist in chist.items():
-        sku_set.add(k)
+    for sku_id, hist in chist.items():
+        sku_set.add(sku_id)
         for dicto in hist:
             goog_time = dicto["usage_start_time"].strftime('%Y-%m-%dT%H%z')
             if goog_time in master_chart:
@@ -325,11 +345,11 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
             else:
                 sku_records = {}
                 master_chart[goog_time] = sku_records
-            if k in sku_records:
-                sku_record = sku_records[k]
+            if sku_id in sku_records:
+                sku_record = sku_records[sku_id]
             else:
-                sku_record = {"calc": 0.0, "goog": 0.0, "disc": 0.0}
-                sku_records[k] = sku_record
+                sku_record = {"calc": 0.0, "goog": 0.0}
+                sku_records[sku_id] = sku_record
 
             sku_record["goog"] += dicto["total_cost"]
 
@@ -337,18 +357,32 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
             # Track the maximum Google cost per sku:
             #
 
-            if k not in google_max:
-                google_max[k] = 0.0
-            if sku_record["goog"] > google_max[k]:
-                google_max[k] = sku_record["goog"]
+            if sku_id not in google_max:
+                google_max[sku_id] = 0.0
+            if sku_record["goog"] > google_max[sku_id]:
+                google_max[sku_id] = sku_record["goog"]
 
             # Capture description from Google:
-            if k not in sku_desc:
-                sku_desc[k] = dicto['sku_description']
+            if sku_id not in sku_desc:
+                sku_desc[sku_id] = dicto['sku_description']
 
     storage_est = _estimate_current_storage_costs(chist, now_time)
-    for sku_id, price in storage_est.items():
-        print("Storage ", sku_id, price)
+    print("FOXME! trunc last realtime record to last hour...")
+    for sku_id, slots in storage_est.items():
+        for slot in slots:
+            goog_time = slot[0].strftime('%Y-%m-%dT%H%z')
+            if goog_time in master_chart:
+                sku_records = master_chart[goog_time]
+            else:
+                sku_records = {}
+                master_chart[goog_time] = sku_records
+            if sku_id in sku_records:
+                sku_record = sku_records[k]
+            else:
+                print("adding GCS sku record ", sku_id, slot)
+                sku_record = {"calc": 0.0, "goog": 0.0, "disc": 0.0}
+                sku_records[sku_id] = sku_record
+            sku_record["calc"] = slot[1]
 
     #
     # All skus that show up in the Google dump need to be present at all time points. This is to
@@ -358,45 +392,63 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
     # or mode, or max, or extrapolate:
     #
 
-    #
-    # NO! FIXME: STORAGE costs show up once a day, and "usage" start and stop is for an hour, but actually holds
-    # the info for the whole day. Need to treat storage costs in that manner.
-    #
-
-
     #for goog_time, sku_records in master_chart.items():
     #    for sku in sku_set:
     #        if sku not in sku_records:
     #            goog_val = google_max[sku] if (sku in google_max) else 0.0
     #            # FIXME: THIS IS NOT A GOOGLE VALUE, BUT A CALC VALUE
-    #            sku_record = {"calc": 0.0, "goog": goog_val, "disc": 0.0}
+    #            sku_record = {"calc": 0.0, "goog": goog_val}
     #            sku_records[sku] = sku_record
 
     #
     # Dump out the sku records:
     #
 
-    for clock_time, sku_records in master_chart.items():
-        for sku in sorted(sku_records.keys()):
-            record = sku_records[sku]
+    clock_times = sorted(master_chart.keys(), reverse=True)
+    for clock_time in clock_times:
+        skus = sorted(master_chart[clock_time].keys())
+        for sku in skus:
+            record = master_chart[clock_time][sku]
             diff = record["calc"] - record["goog"]
             sku_text = sku_desc[sku] if sku in sku_desc else "No description collected"
-            print("{} {} ({}) calc: {} google: {} disc: {} (delta: {})".format(clock_time, sku, sku_text,
-                                                                      record["calc"], record["goog"], record["disc"],
+            print("{} {} ({}) calc: {} google: {} (delta: {})".format(clock_time, sku, sku_text,
+                                                                      record["calc"], record["goog"],
                                                                       str(round(diff, 5))))
             if diff > 0.0:
                 additional_fees += diff
                 #print("added fees now {} added {} from {}".format(additional_fees, diff, sku_text))
-            if record["disc"] > 0.0:
-                total_discounts += record["disc"]
 
         print("-------------------------------------------------------------------------------------")
 
-    print("add {} to the current Google reported spending".format(round(additional_fees, 2)))
-    print("Subtract {} discounts".format(round(total_discounts, 2)))
+    #
+    # Hit the BQ costs export to find out what Google is currently saying the monthly spend is. This
+    # can be up to 24 hours old for some things (e.g. storage), and 6-12 hours old for dynamic
+    # services (VM, BQ):
+    #
 
     total_cost, total_credit = _get_project_cost_for_month_by_sku(COST_BQ, now_month.strftime('%Y-%m-%d'), project_id, now_month.strftime('%Y%m'))
-    print("Total cost and credit for month {}, {}, {}".format(round(total_cost, 2), round(total_credit, 2), round(total_cost + total_credit, 2)))
+
+    print("-------------------------------------------------------------------------------------")
+    print("Our realtime estimate delta OVER the current Google reported spending: ${} ".format(round(additional_fees, 2)))
+
+    total_sus_use_discounts = sus_use_discounts_segregated['cpu_disc'] + sus_use_discounts_segregated['ram_disc'] + sus_use_discounts_segregated['gpu_disc']
+    discount_delta = total_sus_use_discounts - total_credit
+    print("Our discount delta OVER the current Google reported discount: ${} ".format(round(discount_delta, 2)))
+
+    print("-------------------------------------------------------------------------------------")
+    print("Google total cost: ${} and credit: ${} with bottom line: ${} for month".format(round(total_cost, 2), round(total_credit, 2), round(total_cost + total_credit, 2)))
+    combined_cost = round(total_cost + additional_fees, 2)
+    combined_discount = round(total_credit + discount_delta, 2)
+    combined_bottom = round(total_cost + additional_fees + total_credit + discount_delta, 2)
+    #
+    # Towards the end of the month, in the presence of sustained use discounts, VMs get closer
+    # to being "free" (60% discount). So the difference of our estimates of realtime costs
+    # over the current Google reported value diminish over the month, with incremental VM costs
+    # being only 40% of what they were at the start of the month.
+    #
+
+    print("-------------------------------------------------------------------------------------")
+    print("Our realtime estimate total cost: ${} and credit: ${} with bottom line: ${} for month".format(combined_cost, combined_discount, combined_bottom))
 
     #
     # Compute hours to exhaustion:
@@ -460,45 +512,61 @@ def control_billing(project_id, cost_amount, budget_amount, cis, only_estimate_b
             print(message)
             cost_logger.log_text(message)
 
+        #
+        # Have we exceeded budget thresholds? If so, start pulling stuff down to keep spending
+        # under control:
+        #
+
         need_to_act = (fraction >= 1.0)
+        _pull_and_shutdown(need_to_act, project_id, project_name, week_num, fraction,
+                           message_state, running_inventory, message_root_fmt, excess_vm_stop_list)
 
-        if need_to_act:
-            message_key = message_root_fmt.format("2")
-            fire_off = (message_key not in message_state) or message_state[message_key] != week_num
-            if fire_off:
-                print("{}: Project {} is now over budget! fraction {}".format(message_key, project_id, str(fraction)))
-                message_state[message_key] = week_num
 
-        #
-        # If we need to act, do it:
-        #
+    return
 
-        have_appengine = _check_appengine(project_id)
-        if need_to_act:
-            full_stop_list = _prepare_shutdown_list(running_inventory)
-            if len(full_stop_list) > 0:
-                print("Project {} turning off VMs".format(project_id))
-                _process_shutdown_list(project_id, full_stop_list)
-            if have_appengine:
-                print("Project {} turning off App Engine".format(project_id))
-                _turn_off_appengine(project_id)
-                _check_appengine(project_id)
-            print("Project {} finished turning off resources".format(project_id))
-            if fraction >= PULL_MULTIPLIER:
-                message_key = message_root_fmt.format("4")
-                print("{}: Project {} pulling billing account".format(message_key, project_id))
-                _pull_billing_account(project_id, project_name)
-                print("Project {} completed pulling billing account".format(project_id))
-        else:
-            billing_on = _check_billing(project_id, project_name)
-            if billing_on:
-                print("Project {} billing enabled: {}".format(project_id, str(billing_on)))
-            print("Project {} fraction {} still in bounds".format(project_id, str(fraction)))
-            num_excess = len(excess_vm_stop_list)
-            if num_excess > 0:
-                print("Project {} turning off {} excess VMs".format(project_id, num_excess))
-                _process_shutdown_list(project_id, excess_vm_stop_list)
+'''
+----------------------------------------------------------------------------------------------
+If the project has exceeded budget, shut down resources or pull billing account
+'''
 
+def _pull_and_shutdown(need_to_act, project_id, project_name, week_num, fraction,
+                       message_state, running_inventory, message_root_fmt, excess_vm_stop_list):
+    if need_to_act:
+        message_key = message_root_fmt.format("2")
+        fire_off = (message_key not in message_state) or message_state[message_key] != week_num
+        if fire_off:
+            print("{}: Project {} is now over budget! fraction {}".format(message_key, project_id, str(fraction)))
+            message_state[message_key] = week_num
+
+    #
+    # If we need to act, do it:
+    #
+
+    have_appengine = _check_appengine(project_id)
+    if need_to_act:
+        full_stop_list = _prepare_shutdown_list(running_inventory)
+        if len(full_stop_list) > 0:
+            print("Project {} turning off VMs".format(project_id))
+            _process_shutdown_list(project_id, full_stop_list)
+        if have_appengine:
+            print("Project {} turning off App Engine".format(project_id))
+            _turn_off_appengine(project_id)
+            _check_appengine(project_id)
+        print("Project {} finished turning off resources".format(project_id))
+        if fraction >= PULL_MULTIPLIER:
+            message_key = message_root_fmt.format("4")
+            print("{}: Project {} pulling billing account".format(message_key, project_id))
+            _pull_billing_account(project_id, project_name)
+            print("Project {} completed pulling billing account".format(project_id))
+    else:
+        billing_on = _check_billing(project_id, project_name)
+        if billing_on:
+            print("Project {} billing enabled: {}".format(project_id, str(billing_on)))
+        print("Project {} fraction {} still in bounds".format(project_id, str(fraction)))
+        num_excess = len(excess_vm_stop_list)
+        if num_excess > 0:
+            print("Project {} turning off {} excess VMs".format(project_id, num_excess))
+            _process_shutdown_list(project_id, excess_vm_stop_list)
     return
 
 '''
@@ -562,26 +630,25 @@ def _process_budget_state(project_id, bucket, now_time, budget_amount, cost_amou
 prepare VM inventory
 '''
 
-def _prepare_inventory(compute, burn_state, project_id, now_hour, now_time, now_month,
+def _prepare_inventory(burn_state, project_id, now_hour, now_time, now_month,
                        last_inventory_time, discount_tables, roll_discount_tokens,
                        discount_classes, all_ids):
 
+    compute = discovery.build('compute', 'v1', cache_discovery=False)
     running_inventory, type_dict, total_cpus, stopped_inventory = \
         _check_compute_engine_inventory_aggregate(compute, project_id)
     all_vm_dict = burn_state['vm_instances']
     # Handle stopped machines first, to insure their cpu tokens can be swapped by running machines
     # in this iteration
     for k, v in stopped_inventory.items():
-        _build_vm_inventory(v, type_dict, now_hour, now_time, now_month, last_inventory_time,
-                            all_vm_dict, discount_tables)
+        _build_vm_inventory(v, type_dict, now_hour, now_time, now_month, last_inventory_time, all_vm_dict)
         all_ids.add(k[4])
         machine_class = k[1].split('-')[0]
         is_preempt = all_vm_dict[k[4]]['preempt']
         if machine_class in discount_classes and not is_preempt:
             _calc_advanced_sustained_use(k[4], all_vm_dict, burn_state, roll_discount_tokens)
     for k, v in running_inventory.items():
-        _build_vm_inventory(v, type_dict, now_hour, now_time, now_month, last_inventory_time,
-                            all_vm_dict, discount_tables)
+        _build_vm_inventory(v, type_dict, now_hour, now_time, now_month, last_inventory_time, all_vm_dict)
         all_ids.add(k[4])
         machine_class = k[1].split('-')[0]
         is_preempt = all_vm_dict[k[4]]['preempt']
@@ -593,8 +660,7 @@ def _prepare_inventory(compute, burn_state, project_id, now_hour, now_time, now_
     for disk in disk_inventory:
         _build_pd_inventory(disk, now_hour, now_time, all_pd_dict)
 
-    return total_cpus
-
+    return running_inventory, disk_inventory, all_pd_dict, all_vm_dict, total_cpus
 
 '''
 ----------------------------------------------------------------------------------------------
@@ -603,35 +669,97 @@ Estimate_current_storage_costs
 
 def _estimate_current_storage_costs(charge_hist, now_time):
 
-    retval = {}
-    now_stamp = now_time.timestamp()
+    '''
+    5F7A-5173-CF5B
+    Standard Storage Northern Virginia:
+
+    So 24 hours of usage is reported once a day, in a one hour usage slot.
+    It appears the actual export occurs *18* hours after the "end usage", at the same
+    time each day:
+    Export time: 2021-12-18 15:13:54.630 UTC
+    Start_time: 2021-12-17 20:00:00 UTC
+    End time: 2021-12-17 21:00:00 UTC
+    Note that an inter-region copy occurred ~ 2021-12-19 06:00:00 UTC. Check for egress lineitems
+    '''
+
+    #
+    # So. Take the last few timepoints for a storage SKU. If more than one point, check that
+    # the reporting is once a day. Then, using the last point, rubber stamp out
+    # the reporting times so that we have one point in the future. Extrapolate the costs to those
+    # times. Then interpolate to the now time, and add those manufactured points to our cost
+    # history
+    #
+
     gcs_skus = _get_gcs_skus(GCS_PRICES)
     storage_points_per_sku = {}
+    one_day = datetime.timedelta(days=1)
+    one_hour = datetime.timedelta(hours=1)
+    storage_export_times = set()
 
-    for k, hist in charge_hist.items():
+    for sku, hist in charge_hist.items():
         for dicto in hist:
-            if k in gcs_skus:
-                if k in storage_points_per_sku:
-                    storage_points = storage_points_per_sku[k]
+            if sku in gcs_skus:
+                if sku in storage_points_per_sku:
+                    storage_points = storage_points_per_sku[sku]
                 else:
                     storage_points = []
-                    storage_points_per_sku[k] = storage_points
-
-                new_point = [dicto["usage_start_time"].timestamp(), dicto["total_cost"]]
+                    storage_points_per_sku[sku] = storage_points
+                new_point = [dicto["usage_start_time"], dicto["total_cost"]]
+                if dicto["usage_end_time"] - dicto["usage_start_time"] != one_hour:
+                    print("WARNING! Storage SKU {} usage slot is NOT one hour".format(sku))
+                storage_export_times.add(dicto["usage_start_time"].time())
                 storage_points.append(new_point)
 
-    for k, points in storage_points_per_sku.items():
+    if len(storage_export_times) > 1:
+        print("WARNING! More than one daily storage export time", storage_export_times)
+
+    slots_to_fill_per_sku = {}
+    for sku, points in storage_points_per_sku.items():
+        new_slots = []
+        slots_to_fill_per_sku[sku] = new_slots
+        time_slots = [x[0] for x in points]
+        time_slots = sorted(time_slots)
         if len(points) == 1:
-            retval[k] = points[0][1]
+            #
+            # This is where we land when we first store bytes in a region or
+            # multi-region: we will see one, and only one, point.
+            # It appears from logs that this report comes out at the same time for
+            # multiregion and one-region. So we should be able to just use this value
+            # and rubber stamp it out in 24 hour repeats:
+            #
+            next_time = time_slots[0]
+        else:
+            slot_diff = time_slots[-1] - time_slots[-2]
+            if slot_diff != one_day:
+                print("WARNING! Storage SKU {} is NOT spaced at one day".format(sku))
+            next_time = time_slots[-1]
+        while True:
+            next_time = next_time + one_day
+            new_slots.append(next_time)
+            if next_time > now_time:
+                break
+
+    filled_slots_per_sku = {}
+    for sku, slots_to_fill in slots_to_fill_per_sku.items():
+        raw_points = storage_points_per_sku[sku]
+        points = [[x[0].timestamp(), x[1]] for x in raw_points]
+        if len(points) == 1:
+            slope = 0.0
+            intercept = points[0][1]
         else:
             slope, intercept = best_fit(points)
-            now_store = (now_stamp * slope) + intercept
-            if now_store < 0.0:
-                retval[k] = 0.0
+        retval_per_sku = []
+        filled_slots_per_sku[sku] = retval_per_sku
+        for slot in slots_to_fill:
+            slot_val = (slot.timestamp() * slope) + intercept
+            if slot < now_time:
+                retval_per_sku.append((slot, slot_val))
             else:
-                retval[k] = now_store
+                last_past = retval_per_sku[-1][0]
+                frac = (now_time - last_past).total_seconds() / (slot - last_past).total_seconds()
+                retval_per_sku.append((now_time, slot_val * frac))
 
-    return retval
+    return filled_slots_per_sku
 
 '''
 ----------------------------------------------------------------------------------------------
@@ -742,7 +870,7 @@ Build up the VM inventory
 '''
 
 def _build_vm_inventory(machine_info, type_dict, now_hour, now_time, now_month,
-                        last_inventory_time, all_vm_dict, discount_tables):
+                        last_inventory_time, all_vm_dict):
 
     #now_month_str = now_month.strftime('%Y-%m-%dT%H:%M:%S.%f%z')
 
@@ -985,6 +1113,16 @@ def _calc_sustained_disc_from_tokens(token_resource_use, discount_tables):
                     machine_class, discount_tables)
                 cpu_cost += (token_summary['token_price'] * (token_summary['total_minutes'] / 60.0))
                 cpu_disc += (token_summary['token_price'] * (token_summary['total_minutes'] / 60.0)) * (1.0 - cpu_discount)
+                #if token_summary['total_minutes'] / float(token_summary['num_resource']) > (60.0 * 8.0):
+                #    cpu_discount_past = _get_sustained_discount_for_minutes(
+                #        token_summary['total_minutes'] / float(token_summary['num_resource']) - (60.0 * 8.0),
+                #        machine_class, discount_tables)
+                #    print("cpudisc 8 hours ago ", cpu_discount_past)
+                #if token_summary['total_minutes'] / float(token_summary['num_resource']) > (60.0 * 16.0):
+                #    cpu_discount_past = _get_sustained_discount_for_minutes(
+                #        token_summary['total_minutes'] / float(token_summary['num_resource']) - (60.0 * 16.0),
+                #        machine_class, discount_tables)
+                #    print("cpudisc 16 hours ago ", cpu_discount_past)
 
     for region, per_type in token_resource_use['ram_usage'].items():
         for machine_class, token_summary in per_type.items():
@@ -1011,9 +1149,75 @@ def _calc_sustained_disc_from_tokens(token_resource_use, discount_tables):
                 gpu_disc += (token_summary['token_price'] * (token_summary['total_minutes'] / 60.0)) * (1.0 - gpu_discount)
 
 
+    retval = {
+        'cpu_cost': cpu_cost,
+        'cpu_disc': -cpu_disc,
+        'ram_cost': ram_cost,
+        'ram_disc': -ram_disc,
+        'gpu_cost': gpu_cost,
+        'gpu_disc': -gpu_disc
+    }
 
     print(cpu_cost, cpu_disc, ram_cost, ram_disc, gpu_cost, gpu_disc)
-    return
+    return retval
+
+'''
+----------------------------------------------------------------------------------------------
+Calculate sustained use discount
+'''
+
+def _calc_sustained_disc_from_tokens_segregated(token_resource_use, discount_tables):
+
+    cpu_cost = 0.0
+    ram_cost = 0.0
+    gpu_cost = 0.0
+    cpu_disc = 0.0
+    ram_disc = 0.0
+    gpu_disc = 0.0
+
+    for region, per_type in token_resource_use['cpu_usage'].items():
+        for machine_class, token_summary in per_type.items():
+            if token_summary is not None and len(token_summary) > 0:
+                for tok in token_summary:
+                    cpu_discount = _get_sustained_discount_for_minutes(tok[0], machine_class, discount_tables)
+                    cpu_cost += tok[1] * tok[2] * (tok[0] / 60.0)
+                    cpu_disc += (tok[1] * tok[2] * (tok[0] / 60.0)) * (1.0 - cpu_discount)
+
+                    #if tok[0] > (60.0 * 48.0):
+                    #  cpu_discount_past = _get_sustained_discount_for_minutes(tok[0]- (60.0 * 48.0), machine_class, discount_tables)
+                    #  print("cpudisc 48 hours ago ", cpu_discount_past)
+
+    for region, per_type in token_resource_use['ram_usage'].items():
+        for machine_class, token_summary in per_type.items():
+            if token_summary is not None and len(token_summary) > 0:
+                for tok in token_summary:
+                    ram_discount = _get_sustained_discount_for_minutes(tok[0], machine_class, discount_tables)
+                    ram_cost += tok[1] * tok[2] * (tok[0] / 60.0)
+                    ram_disc += (tok[1] * tok[2] * (tok[0] / 60.0)) * (1.0 - ram_discount)
+
+                    #if tok[0] > (60.0 * 48.0):
+                    #  ram_discount_past = _get_sustained_discount_for_minutes(tok[0]- (60.0 * 48.0), machine_class, discount_tables)
+                    #  print("ramdisc 48 hours ago ", ram_discount_past)
+
+    for region, per_type in token_resource_use['gpu_usage'].items():
+        for machine_class, token_summary in per_type.items():
+            for tok in token_summary:
+                gpu_discount = _get_sustained_discount_for_minutes(tok[0], 'any_gpu', discount_tables)
+                gpu_cost += tok[1] * tok[2] * (tok[0] / 60.0)
+                gpu_disc += (tok[1] * tok[2] * (tok[0] / 60.0)) * (1.0 - gpu_discount)
+    retval = {
+        'cpu_cost': cpu_cost,
+        'cpu_disc': -cpu_disc,
+        'ram_cost': ram_cost,
+        'ram_disc': -ram_disc,
+        'gpu_cost': gpu_cost,
+        'gpu_disc': -gpu_disc
+    }
+
+    print(cpu_cost, cpu_disc, ram_cost, ram_disc, gpu_cost, gpu_disc)
+    return retval
+
+
 
 '''
 ----------------------------------------------------------------------------------------------
@@ -1025,6 +1229,20 @@ def _calc_running_tokens(vm_dict, token_resource_use, vm_region, machine_class):
     _sum_running_resource_tokens(vm_dict, token_resource_use, vm_region, machine_class, 'cpu_tokens', 'cpu_usage')
     _sum_running_resource_tokens(vm_dict, token_resource_use, vm_region, machine_class, 'ram_tokens', 'ram_usage')
     _sum_running_resource_tokens(vm_dict, token_resource_use, vm_region, machine_class, 'gpu_tokens', 'gpu_usage')
+
+    return
+
+
+'''
+----------------------------------------------------------------------------------------------
+Calculate resource tied to tokens in use for the given machine
+'''
+
+def _calc_running_tokens_segregated(vm_dict, token_resource_use, vm_region, machine_class):
+
+    _sum_running_resource_tokens_segregated(vm_dict, token_resource_use, vm_region, machine_class, 'cpu_tokens', 'cpu_usage', vm_dict['cpus'])
+    _sum_running_resource_tokens_segregated(vm_dict, token_resource_use, vm_region, machine_class, 'ram_tokens', 'ram_usage', vm_dict['memory_gb'])
+    _sum_running_resource_tokens_segregated(vm_dict, token_resource_use, vm_region, machine_class, 'gpu_tokens', 'gpu_usage', len(vm_dict['accel']))
 
     return
 
@@ -1057,7 +1275,31 @@ def _sum_running_resource_tokens(vm_dict, token_resource_use, vm_region, machine
         elif token_summary['token_price'] != price:
             raise Exception("Token price mismatch {} {}".format(token_summary['token_price'], price))
 
-    print(token_summary)
+    return
+
+'''
+----------------------------------------------------------------------------------------------
+Calculate resource tied to tokens in use for the given machine
+'''
+
+def _sum_running_resource_tokens_segregated(vm_dict, token_resource_use, vm_region, machine_class, resource_key, use_key, resource_amt):
+    tok_use_list = _add_machine_resource_tokens_segregated(vm_dict, resource_key, resource_amt)
+    toks = token_resource_use[use_key]
+
+    if vm_region in toks:
+        machine_dict = toks[vm_region]
+    else:
+        machine_dict = {}
+        toks[vm_region] = machine_dict
+
+    if machine_class in machine_dict:
+        token_summary = machine_dict[machine_class]
+    else:
+        token_summary = []
+        machine_dict[machine_class] = token_summary
+
+    for tok_use in tok_use_list:
+        token_summary.append(tok_use)
 
     return
 
@@ -1077,6 +1319,23 @@ def _calc_unused_tokens(burn_state):
 
     return unused_resource_use
 
+
+'''
+----------------------------------------------------------------------------------------------
+Calculate hours tied to unused tokens
+'''
+
+def _calc_unused_tokens_segregated(burn_state):
+
+    unused_resource_use = {
+        "cpu_usage": _token_sum_segregated(burn_state["discount_cpu_tokens"]),
+        "ram_usage": _token_sum_segregated(burn_state["discount_ram_tokens"]),
+        "gpu_usage": _token_sum_segregated(burn_state["discount_gpu_tokens"])
+    }
+
+    return unused_resource_use
+
+
 '''
 ----------------------------------------------------------------------------------------------
 Sum up and store: for region x, for machine type y, we have n minutes of time tied to z tokens
@@ -1084,7 +1343,6 @@ Sum up and store: for region x, for machine type y, we have n minutes of time ti
 
 def _token_sum(token_resource):
     resource_usage = {}
-    print("TS")
     if 'tokens_by_zones' in token_resource:
         tokens_by_zones = token_resource['tokens_by_zones']
         for region, pool in tokens_by_zones.items():
@@ -1105,7 +1363,6 @@ def _token_sum(token_resource):
 
                 for hour, tok_list_for_hour in token_dict['tokens'].items():
                     for token in tok_list_for_hour:
-                        print("TOKEN", token)
                         if token_summary['token_price'] is None:
                             token_summary['token_price'] = token['token_price']
                         elif token_summary['token_price'] != token['token_price']:
@@ -1113,9 +1370,40 @@ def _token_sum(token_resource):
                         # FIXME? WAS NOT SUMMED?
                         token_summary['total_minutes'] += token['current_usage'] + token['prior_usage']
                         token_summary['num_resource'] += 1
-                        print(token_summary)
 
     return resource_usage
+
+'''
+----------------------------------------------------------------------------------------------
+Sum up and store: for region x, for machine type y, we have n minutes of time tied to z tokens
+'''
+
+def _token_sum_segregated(token_resource):
+    resource_usage = {}
+    if 'tokens_by_zones' in token_resource:
+        tokens_by_zones = token_resource['tokens_by_zones']
+        for region, pool in tokens_by_zones.items():
+
+            if region in resource_usage:
+                machine_dict = resource_usage[region]
+            else:
+                machine_dict = {}
+                resource_usage[region] = machine_dict
+
+            for machine_class, token_dict in pool.items():
+
+                if machine_class in machine_dict:
+                    token_summary = machine_dict[machine_class]
+                else:
+                    token_summary = []
+                    machine_dict[machine_class] = token_summary
+
+                for hour, tok_list_for_hour in token_dict['tokens'].items():
+                    for token in tok_list_for_hour:
+                        token_summary.append((token['current_usage'] + token['prior_usage'], token['token_price'], 1.0))
+
+    return resource_usage
+
 
 '''
 ----------------------------------------------------------------------------------------------
@@ -1267,11 +1555,10 @@ def _calc_advanced_sustained_use(machine_id, all_vm_dict, burn_state, initialize
             accel_type = accel_entry['type']
 
             for key in vm_dict['skus']['gpu_sku']:
-                print("FIXME: multiple GPU types?")
+                print("FIXME: multiple GPU types possible?")
                 token_price = vm_dict['skus']['gpu_sku'][key][3]
                 break
 
-            print("FIXME!! we see two GPU token on a machine")
             #if vm_region != accel_entry['zone']:
             #    raise Exception("accel VM region mismatch {} {}".format(vm_region, accel_entry['zone']))
             allocate_tokens(need_tokens, vm_dict, machine_id, region_token_pool, uptime,
@@ -1645,7 +1932,6 @@ Fill in a time series
 '''
 
 def _fill_time_series_too(now_hour, now_time, vm_dict, max_history):
-
 
     last_start_record = vm_dict['last_start_uptime_record']
     last_stop_record = vm_dict['last_stop_uptime_record']
@@ -2240,6 +2526,25 @@ def _add_machine_resource_tokens(vm_dict, resource_key):
                 raise Exception("Token price mismatch {} {}".format(tok_price, tok['token_price']))
     return minutes, num_tok, tok_price
 
+
+'''
+----------------------------------------------------------------------------------------------
+How many hours of sustained discount on this machine? Keep tokens segregated
+'''
+
+def _add_machine_resource_tokens_segregated(vm_dict, resource_key, resource_amt):
+    retval = []
+    if resource_key not in vm_dict:
+        return retval
+    resource_tokens = vm_dict[resource_key]
+    resource_remains = resource_amt
+    for key, val in resource_tokens.items():
+        for tok in val:
+            resource_chunk = 1.0 if resource_remains > 1.0 else resource_remains
+            retval.append((tok['current_usage'] + tok['prior_usage'], tok['token_price'], resource_chunk))
+            resource_remains -= 1.0
+    return retval
+
 '''
 ----------------------------------------------------------------------------------------------
 Compute the cost of the given machine over the given number of hours:
@@ -2265,9 +2570,6 @@ def _core_and_ram_and_gpu_cost(hours, vm_dict, cost_per_sku):
         else:
             print("Multiple RAM SKUs")
             break
-
-    if 'cpu_discounts_per_hour' in vm_dict: # FIXME DEV ONLY
-        vm_dict.pop('cpu_discounts_per_hour')
 
     core_per_hour = 0.0
     gb_per_hour = 0.0
@@ -2301,6 +2603,10 @@ def _core_and_ram_and_gpu_cost(hours, vm_dict, cost_per_sku):
 
         ram_sku = cpu_price_lineitem[8]
         this_ram_sku = hours * vm_dict['memory_gb'] * gb_per_hour
+        #
+        # This is the running total across ALL machines in the machine class:
+        #
+        cost_per_sku[ram_sku] = (this_ram_sku + cost_per_sku[ram_sku]) if (ram_sku in cost_per_sku) else this_ram_sku
 
     else:
         raise Exception("unexpected pricing units: {} {}".format(cpu_price_lineitem[4], ram_price_lineitem[6]))
@@ -3288,6 +3594,12 @@ def _get_project_cost_for_month_sql(table_name, first_of_month, project_id, invo
 Get cumulative project cost for month
 '''
 def _get_project_cost_for_month_by_sku(cost_table, first_of_month, project_id, invoice):
+    print()
+    print()
+    print("-----------------------------------------------------------------------------------")
+    print("Reported Costs for Current Month by Google:")
+    print()
+
     sql = _get_project_cost_for_month_by_sku_sql(cost_table, first_of_month, project_id, invoice)
     results = _bq_harness_with_result(sql, False)
     tc = 0.0
@@ -3423,6 +3735,7 @@ def stats(df, i):
 '''
 
 def best_fit(df):
+
   ave_x = stats(df, 0)
   ave_y = stats(df, 1)
   m = sum([l[0] * (l[1] - ave_y) for l in df]) / sum([l[0] * (l[0] - ave_x) for l in df])
