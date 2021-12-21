@@ -25,6 +25,7 @@ import io
 import os
 from os.path import expanduser
 from json import loads as json_loads
+import datetime
 
 
 '''
@@ -227,6 +228,7 @@ def generate_gcs_table(sku_table, target_dataset, dest_table, do_batch):
 SQL for above
 '''
 def generate_gcs_table_sql(sku_table):
+    print("FIXME: exclude (Early Delete) skus?")
     return '''
         SELECT DISTINCT service.description as service_desc,
                sku.id,
@@ -237,8 +239,7 @@ def generate_gcs_table_sql(sku_table):
                tr.usd_amount
         FROM `idc-external-admin.idc_external_skus.cloud_pricing_export`,
         UNNEST(billing_account_price.tiered_rates) as tr
-        WHERE DATE(_PARTITIONTIME) = "2021-12-17"
-        AND service.description = "Cloud Storage"
+        WHERE service.description = "Cloud Storage"
         AND sku.description LIKE "%Storage%"
         AND sku.description NOT LIKE "%gress%"
         '''.format(sku_table)
@@ -248,30 +249,30 @@ def generate_gcs_table_sql(sku_table):
 ----------------------------------------------------------------------------------------------
 Extract ip address related skus from the whole-sku table exported by Google
 '''
-def generate_ip_table(sku_table, target_dataset, dest_table, do_batch):
+def generate_ip_table(sku_table, target_dataset, dest_table, do_batch, today):
 
-    sql = generate_ip_table_sql(sku_table)
+    sql = generate_ip_table_sql(sku_table, today)
     return generic_bq_harness(sql, target_dataset, dest_table, do_batch, True)
 
 '''
 ----------------------------------------------------------------------------------------------
 SQL for above
 '''
-def generate_ip_table_sql(sku_table):
+def generate_ip_table_sql(sku_table, today):
     return '''
-        WITH a1 AS (SELECT DISTINCT
+        SELECT DISTINCT
             TRIM(REGEXP_EXTRACT(sku.description, "(.*) on a .*")) AS ip_key,
                (STRPOS(sku.description, "reemptible") != 0) as preemptible,
                sku.id as sku_id,
                tr.usd_amount as usd_amount,
-               pricing_unit
+               pricing_unit,
+               tr.start_usage_amount
         FROM `{0}`,
         UNNEST(billing_account_price.tiered_rates) as tr
         WHERE (sku.description LIKE "% IP %")
-        AND service.description LIKE "%Compute%")
-        SELECT ip_key, preemptible, sku_id, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit FROM a1
-        GROUP BY ip_key, preemptible, sku_id, pricing_unit
-        '''.format(sku_table)
+        AND service.description LIKE "%Compute%"
+        and DATE(_PARTITIONTIME) = "{1}"
+        '''.format(sku_table, today)
 
 '''
 ----------------------------------------------------------------------------------------------
@@ -323,16 +324,16 @@ def generate_gpu_lic_table_sql(sku_table):
 ----------------------------------------------------------------------------------------------
 Extract CPU licensing pricing related skus from the whole-sku table exported by Google
 '''
-def generate_cpu_lic_table(sku_table, target_dataset, dest_table, do_batch):
+def generate_cpu_lic_table(sku_table, target_dataset, dest_table, do_batch, now_day):
 
-    sql = generate_cpu_lic_table_sql(sku_table)
+    sql = generate_cpu_lic_table_sql(sku_table, now_day)
     return generic_bq_harness(sql, target_dataset, dest_table, do_batch, True)
 
 '''
 ----------------------------------------------------------------------------------------------
 SQL for above
 '''
-def generate_cpu_lic_table_sql(sku_table):
+def generate_cpu_lic_table_sql(sku_table, now_day):
     return '''
         WITH a1 AS (SELECT DISTINCT
                CASE WHEN (STRPOS(sku.description, " on g1-small") != 0) THEN "g1-small"
@@ -371,10 +372,11 @@ def generate_cpu_lic_table_sql(sku_table):
         FROM `{0}`,
         UNNEST(billing_account_price.tiered_rates) as tr
         WHERE (sku.description LIKE "%Licen%" AND NOT sku.description LIKE "%GPU%" AND NOT sku.description LIKE "%RAM cost%")
-        AND service.description LIKE "%Compute%")
+        AND service.description LIKE "%Compute%"
+        AND DATE(_PARTITIONTIME) = "{1}")
         SELECT machine_class, lic_key, min_cpu, max_cpu, sku_id, MAX(usd_amount) AS max_usd, MIN(usd_amount) AS min_usd, pricing_unit FROM a1
         GROUP BY machine_class, lic_key, min_cpu, max_cpu, sku_id, pricing_unit
-        '''.format(sku_table)
+        '''.format(sku_table, now_day)
 
 '''
 ----------------------------------------------------------------------------------------------
@@ -566,6 +568,8 @@ def main(args):
 
     home = expanduser("~")
 
+    now_day = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d')
+
     if 'upload_map_csvs' in steps:
         for table_map in mappings:
             _, table_dict = next(iter(table_map.items()))
@@ -608,7 +612,7 @@ def main(args):
             return
 
     if 'build_cpu_lic_pricing' in steps:
-        success = generate_cpu_lic_table(params['SKU_TABLE'], params['TARGET_DATASET'], params['CPU_LIC_PRICING'], params['BQ_AS_BATCH'])
+        success = generate_cpu_lic_table(params['SKU_TABLE'], params['TARGET_DATASET'], params['CPU_LIC_PRICING'], params['BQ_AS_BATCH'], now_day)
         if not success:
             print("Build CPU license table failed")
             return
@@ -626,7 +630,8 @@ def main(args):
             return
 
     if 'build_ip_pricing' in steps:
-        success = generate_ip_table(params['SKU_TABLE'], params['TARGET_DATASET'], params['IP_PRICING'], params['BQ_AS_BATCH'])
+        success = generate_ip_table(params['SKU_TABLE'], params['TARGET_DATASET'],
+                                    params['IP_PRICING'], params['BQ_AS_BATCH'], now_day)
         if not success:
             print("Build ip table failed")
             return
@@ -666,66 +671,3 @@ def main(args):
 if __name__ == "__main__":
     main(sys.argv)
 
-
-
-
-
-'''
-
-
-
-
-        SELECT DISTINCT service.description as service_desc,
-               sku.id,
-               sku.description as sku_desc,
-               geo_taxonomy.type,
-               gt_region,
-               pricing_unit,
-               tr.start_usage_amount,
-               tr.usd_amount
-        FROM `idc-external-admin.idc_external_skus.cloud_pricing_export`,
-        UNNEST(billing_account_price.tiered_rates) as tr,
-        UNNEST(geo_taxonomy.regions) as gt_region
-        WHERE service.description LIKE "%BigQuery%"
-
-
-        SELECT DISTINCT service.description as service_desc,
-               sku.id,
-               sku.description as sku_desc,
-               geo_taxonomy.type,
-               gt_region,
-               pricing_unit,
-               tr.start_usage_amount,
-               tr.usd_amount
-        FROM `idc-external-admin.idc_external_skus.cloud_pricing_export`,
-        UNNEST(billing_account_price.tiered_rates) as tr,
-        UNNEST(geo_taxonomy.regions) as gt_region,
-        WHERE service.description LIKE "%BigQuery%"
-
-
-        SELECT DISTINCT service.description as service_desc,
-               sku.id,
-               sku.description as sku_desc,
-               geo_taxonomy.type,
-               gt_region,
-               pricing_unit,
-               tr.start_usage_amount,
-               tr.usd_amount
-        FROM `idc-external-admin.idc_external_skus.cloud_pricing_export`,
-        UNNEST(billing_account_price.tiered_rates) as tr,
-        UNNEST(geo_taxonomy.regions) as gt_region,
-        WHERE service.description LIKE "%BigQuery%"
-
-        SELECT DISTINCT service.description as service_desc,
-               sku.id,
-               sku.description as sku_desc,
-               pricing_unit,
-               tr.start_usage_amount,
-               tr.usd_amount
-        FROM `idc-external-admin.idc_external_skus.cloud_pricing_export`,
-        UNNEST(billing_account_price.tiered_rates) as tr
-        WHERE service.description LIKE "%BigQuery%"
-
-
-
-'''
